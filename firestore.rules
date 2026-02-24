@@ -1,0 +1,64 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function myCompanyId() {
+      return get(
+        /databases/$(database)/documents/users/$(uid())
+      ).data.companyId;
+    }
+
+    match /companies/{companyId} {
+      allow read, create, update: if signedIn();
+      allow delete: if false;
+
+      match /teams/{teamId} {
+        allow read, create: if signedIn() && companyId == myCompanyId();
+        allow update, delete: if false;
+      }
+
+      match /teamInvites/{inviteId} {
+        allow read, create: if signedIn() && companyId == myCompanyId();
+        allow update, delete: if false;
+      }
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() &&
+        (
+          userId == uid() ||
+          (resource.data.companyId != null && resource.data.companyId == myCompanyId())
+        );
+
+      allow create, update: if signedIn() && userId == uid();
+      allow delete: if false;
+
+      match /documents/{docId} {
+        allow read, create, update, delete: if signedIn() && userId == uid();
+      }
+
+      match /messages/{messageId} {
+        allow read, create, update, delete: if signedIn() && userId == uid();
+      }
+
+      match /chats/{chatId} {
+        allow read, create, update, delete: if signedIn() && userId == uid();
+
+        match /messages/{messageId} {
+          allow read, create, update, delete: if signedIn() && userId == uid();
+        }
+
+        match /documents/{docId} {
+          allow read, create, update, delete: if signedIn() && userId == uid();
+        }
+      }
+    }
+  }
+}
