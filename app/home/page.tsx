@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { User, onAuthStateChanged, signOut } from "firebase/auth";
 import {
@@ -10,6 +10,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocs,
   limit,
   onSnapshot,
   orderBy,
@@ -71,6 +72,12 @@ type SourceItem = {
 type ChatMessage = {
   id: string;
   sender: "user" | "assistant";
+  text: string;
+  createdAt?: Date;
+};
+
+type SavedMemo = {
+  id: string;
   text: string;
   createdAt?: Date;
 };
@@ -228,6 +235,32 @@ function buildAssistantReply(question: string, sources: SourceItem[]): string {
   return `「${bestSource.name}」を参照: ${bestSnippet}`;
 }
 
+function pickRelevantSourceNames(question: string, sources: SourceItem[], limitCount = 3): string[] {
+  if (sources.length === 0) return [];
+
+  const normalizedQuestion = normalizeText(question);
+  const tokens = normalizedQuestion
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
+
+  const scored = sources.map((source) => {
+    const normalizedSource = normalizeText(source.text);
+    if (!normalizedSource) return { name: source.name, score: 0 };
+    const score = tokens.reduce((acc, token) => (normalizedSource.includes(token) ? acc + 1 : acc), 0);
+    return { name: source.name, score };
+  });
+
+  const top = scored
+    .sort((a, b) => b.score - a.score)
+    .filter((item) => item.score > 0)
+    .slice(0, limitCount)
+    .map((item) => item.name);
+
+  if (top.length > 0) return Array.from(new Set(top));
+  return Array.from(new Set(sources.slice(0, limitCount).map((source) => source.name)));
+}
+
 function formatAssistantMessage(text: string): string {
   return text
     .replace(/^\s{0,3}#{1,6}\s*/gm, "")
@@ -381,6 +414,9 @@ export default function HomePage() {
   const [globalSources, setGlobalSources] = useState<SourceItem[]>([]);
   const [sources, setSources] = useState<SourceItem[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [showMemoModal, setShowMemoModal] = useState(false);
+  const [savedMemos, setSavedMemos] = useState<SavedMemo[]>([]);
   const pdfInputRef = useRef<HTMLInputElement | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const logError = (context: string, error: unknown) => {
@@ -646,6 +682,37 @@ export default function HomePage() {
       setSelectedKnowledge(null);
     }
   }, [sources, selectedKnowledge]);
+
+  useEffect(() => {
+    if (!authUser || !showMemoModal) {
+      setSavedMemos([]);
+      return;
+    }
+    const memosQuery = query(
+      collection(db, "users", authUser.uid, "memos"),
+      orderBy("createdAt", "desc"),
+      limit(100),
+    );
+    const unsub = onSnapshot(
+      memosQuery,
+      (snapshot) => {
+        const next = snapshot.docs.map((memoDoc) => ({
+          id: memoDoc.id,
+          text: String(memoDoc.data().text ?? ""),
+          createdAt: toDate(memoDoc.data().createdAt),
+        }));
+        setSavedMemos(next);
+      },
+      (snapshotError) => logError("memos-snapshot", snapshotError),
+    );
+    return () => unsub();
+  }, [authUser, showMemoModal]);
+
+  useEffect(() => {
+    if (!actionNotice) return;
+    const timer = window.setTimeout(() => setActionNotice(null), 1800);
+    return () => window.clearTimeout(timer);
+  }, [actionNotice]);
 
   useEffect(() => {
     if (!authUser || !selectedChatId) {
@@ -992,6 +1059,12 @@ export default function HomePage() {
       if (!assistantReply) {
         assistantReply = buildAssistantReply(userQuestion, targetSources);
       }
+      const referenceNames = pickRelevantSourceNames(userQuestion, targetSources);
+      if (!assistantReply.includes("参照ナレッジ:")) {
+        assistantReply = `${assistantReply}\n\n参照ナレッジ: ${
+          referenceNames.length > 0 ? referenceNames.join(" / ") : "なし"
+        }`;
+      }
       await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
         sender: "assistant",
         text: assistantReply,
@@ -1026,7 +1099,11 @@ export default function HomePage() {
     try {
       const deletingTeamLocalSource = activeChat.type === "team" && !source.inheritedFromDocumentId;
       if (source.storagePath && (activeChat.type !== "team" || deletingTeamLocalSource)) {
-        await deleteObject(ref(storage, source.storagePath));
+        try {
+          await deleteObject(ref(storage, source.storagePath));
+        } catch (storageError) {
+          logError("delete-source-storage", storageError);
+        }
       }
       if (activeChat.type === "team") {
         if (!selectedChatId) return;
@@ -1042,6 +1119,187 @@ export default function HomePage() {
     } finally {
       setDeletingSourceId(null);
     }
+  };
+
+  const handleCopyMessage = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(formatAssistantMessage(text));
+      setActionNotice("回答をコピーしました。");
+    } catch (error) {
+      logError("copy-message", error);
+    }
+  };
+
+  const handleSaveMemo = async (text: string) => {
+    if (!authUser) return;
+    try {
+      const formatted = formatAssistantMessage(text);
+      const memosCol = collection(db, "users", authUser.uid, "memos");
+      await addDoc(memosCol, {
+        text: formatted,
+        createdAt: serverTimestamp(),
+      });
+
+      const overflowQuery = query(memosCol, orderBy("createdAt", "desc"), limit(200));
+      const overflowSnap = await getDocs(overflowQuery);
+      const overflowDocs = overflowSnap.docs.slice(100);
+      await Promise.all(overflowDocs.map((memoDoc) => deleteDoc(memoDoc.ref)));
+      setActionNotice("メモに保存しました。");
+    } catch (error) {
+      logError("save-memo", error);
+    }
+  };
+
+  const openMemoModal = () => {
+    setShowMemoModal(true);
+  };
+
+  const handleDeleteMemo = async (memoId: string) => {
+    if (!authUser) return;
+    try {
+      await deleteDoc(doc(db, "users", authUser.uid, "memos", memoId));
+      setActionNotice("メモを削除しました。");
+    } catch (error) {
+      logError("delete-memo", error);
+    }
+  };
+
+  const handleClearMemos = async () => {
+    if (!authUser) return;
+    const shouldDelete = window.confirm("メモをすべて削除しますか？");
+    if (!shouldDelete) return;
+    try {
+      const memosCol = collection(db, "users", authUser.uid, "memos");
+      while (true) {
+        const chunk = await getDocs(query(memosCol, limit(200)));
+        if (chunk.empty) break;
+        await Promise.all(chunk.docs.map((memoDoc) => deleteDoc(memoDoc.ref)));
+      }
+      setActionNotice("メモをすべて削除しました。");
+    } catch (error) {
+      logError("clear-memos", error);
+    }
+  };
+
+  const renderTextWithLinks = (line: string, keyPrefix: string): ReactNode[] => {
+    const nodes: ReactNode[] = [];
+    const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+    const plainUrlRegex = /(https?:\/\/[^\s]+)/g;
+    let lineCursor = 0;
+    let markdownMatch: RegExpExecArray | null;
+    let nodeIndex = 0;
+
+    const pushTextWithPlainUrls = (segment: string, segmentKey: string) => {
+      let textCursor = 0;
+      let plainMatch: RegExpExecArray | null;
+      plainUrlRegex.lastIndex = 0;
+      while ((plainMatch = plainUrlRegex.exec(segment)) !== null) {
+        const [url] = plainMatch;
+        const start = plainMatch.index;
+        if (start > textCursor) {
+          nodes.push(segment.slice(textCursor, start));
+        }
+        nodes.push(
+          <a
+            key={`${segmentKey}-url-${nodeIndex += 1}`}
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="underline decoration-[#6d89df] underline-offset-2 hover:text-[#163a95]"
+          >
+            {url}
+          </a>,
+        );
+        textCursor = start + url.length;
+      }
+      if (textCursor < segment.length) {
+        nodes.push(segment.slice(textCursor));
+      }
+    };
+
+    markdownLinkRegex.lastIndex = 0;
+    while ((markdownMatch = markdownLinkRegex.exec(line)) !== null) {
+      const [fullMatch, label, href] = markdownMatch;
+      const start = markdownMatch.index;
+      if (start > lineCursor) {
+        pushTextWithPlainUrls(line.slice(lineCursor, start), `${keyPrefix}-text-${nodeIndex += 1}`);
+      }
+      nodes.push(
+        <a
+          key={`${keyPrefix}-md-${nodeIndex += 1}`}
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+          className="underline decoration-[#6d89df] underline-offset-2 hover:text-[#163a95]"
+        >
+          {label}
+        </a>,
+      );
+      lineCursor = start + fullMatch.length;
+    }
+
+    if (lineCursor < line.length) {
+      pushTextWithPlainUrls(line.slice(lineCursor), `${keyPrefix}-tail-${nodeIndex += 1}`);
+    }
+
+    return nodes;
+  };
+
+  const renderAssistantContent = (rawText: string) => {
+    const formatted = formatAssistantMessage(rawText);
+    const lines = formatted.split("\n");
+
+    return (
+      <div className="space-y-1 leading-relaxed">
+        {lines.map((line, index) => {
+          if (!line.trim()) {
+            return <div key={`line-${index}`} className="h-1" />;
+          }
+
+          if (line.startsWith("参照ナレッジ:")) {
+            const refsRaw = line.replace("参照ナレッジ:", "").trim();
+            if (!refsRaw || refsRaw === "なし") {
+              return (
+                <div key={`line-${index}`} className="text-sm text-[#465272]">
+                  参照ナレッジ: なし
+                </div>
+              );
+            }
+            const names = refsRaw.split(/\s*\/\s*/).map((name) => name.trim()).filter(Boolean);
+            return (
+              <div key={`line-${index}`} className="flex flex-wrap items-center gap-1 text-sm text-[#465272]">
+                <span>参照ナレッジ:</span>
+                {names.map((name, nameIndex) => {
+                  const matched = sources.find((source) => source.name === name);
+                  if (matched) {
+                    return (
+                      <button
+                        key={`ref-${name}-${nameIndex}`}
+                        type="button"
+                        onClick={() => {
+                          setSelectedKnowledge({ id: matched.id, name: matched.name });
+                          setShowUploadedList(true);
+                        }}
+                        className="rounded-sm border border-[#bdd0ff] bg-white px-2 py-0.5 text-xs font-medium text-[#1d46a6] hover:bg-[#eef4ff]"
+                      >
+                        {name}
+                      </button>
+                    );
+                  }
+                  return (
+                    <span key={`ref-${name}-${nameIndex}`} className="text-xs text-[#55617f]">
+                      {name}
+                    </span>
+                  );
+                })}
+              </div>
+            );
+          }
+
+          return <div key={`line-${index}`}>{renderTextWithLinks(line, `line-${index}`)}</div>;
+        })}
+      </div>
+    );
   };
 
   const handleLogout = async () => {
@@ -1151,7 +1409,7 @@ export default function HomePage() {
 
   return (
     <div className="h-screen overflow-hidden bg-[radial-gradient(1200px_620px_at_20%_-10%,#e7eeff_0%,#edf1fa_45%,#e9edf6_100%)]">
-      <div className="origin-top-left h-[calc(100vh/0.65)] [transform:scale(0.65)] [width:calc(100%/0.65)] p-5 md:p-6">
+      <div className="h-full p-4 text-[15px] md:p-6">
         <div className="grid h-full grid-cols-1 gap-3 lg:grid-cols-[420px_1fr]">
           <aside className="rounded-lg border border-[#d8deef] bg-white/90 shadow-[0_14px_40px_rgba(17,41,120,0.08)] backdrop-blur-sm">
             <div className="border-b border-[#dedfea] px-6 py-4">
@@ -1347,6 +1605,13 @@ export default function HomePage() {
                   >
                     {showUploadedList ? "一覧を閉じる" : "一覧を開く"}
                   </button>
+                  <button
+                    type="button"
+                    onClick={openMemoModal}
+                    className="rounded-md border border-[#cfd8f0] bg-white px-2 py-1 text-xs font-medium text-[#1440e1] hover:bg-[#f7f9ff]"
+                  >
+                    メモ一覧
+                  </button>
                 </div>
               </div>
             </div>
@@ -1408,6 +1673,11 @@ export default function HomePage() {
               ) : null}
 
               <div ref={messagesContainerRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto p-6">
+                {actionNotice ? (
+                  <div className="rounded-sm border border-[#d9e4ff] bg-[#f2f6ff] px-3 py-2 text-sm text-[#21459c]">
+                    {actionNotice}
+                  </div>
+                ) : null}
                 {messages.length === 0 && activeChat.type === "team" && sources.length === 0 ? (
                   <div className="mx-auto mt-20 max-w-2xl text-center">
                     <h3 className="text-3xl font-semibold text-[#333640]">
@@ -1423,7 +1693,7 @@ export default function HomePage() {
                   message.sender === "user" ? (
                     <div
                       key={message.id}
-                      className="relative ml-auto w-fit max-w-3xl rounded-[10px] border border-[#e1e6f2] bg-white px-4 py-3 text-sm text-[#1f2433] shadow-[3px_3px_0_0_#d6dae4] after:absolute after:-bottom-[6px] after:right-2 after:h-3 after:w-3 after:rotate-45 after:border-r after:border-b after:border-[#e1e6f2] after:bg-white after:shadow-[2px_2px_0_0_#d6dae4] after:content-['']"
+                      className="relative ml-auto w-fit max-w-3xl rounded-[10px] border border-[#e1e6f2] bg-white px-4 py-3 text-base text-[#1f2433] shadow-[3px_3px_0_0_#d6dae4] after:absolute after:-bottom-[6px] after:right-2 after:h-3 after:w-3 after:rotate-45 after:border-r after:border-b after:border-[#e1e6f2] after:bg-white after:shadow-[2px_2px_0_0_#d6dae4] after:content-['']"
                     >
                       <p>{message.text}</p>
                     </div>
@@ -1447,10 +1717,24 @@ export default function HomePage() {
                           <path d="M9 15h6" />
                         </svg>
                       </div>
-                      <div className="w-fit max-w-3xl rounded-[10px] border border-[#cfdcff] bg-[#eaf0ff] px-4 py-3 text-sm text-[#1f2a44] shadow-[3px_3px_0_0_#cfdcff]">
-                        <p className="whitespace-pre-wrap leading-relaxed">
-                          {formatAssistantMessage(message.text)}
-                        </p>
+                      <div className="w-fit max-w-3xl rounded-[10px] border border-[#cfdcff] bg-[#eaf0ff] px-4 py-3 text-base text-[#1f2a44] shadow-[3px_3px_0_0_#cfdcff]">
+                        {renderAssistantContent(message.text)}
+                        <div className="mt-3 flex items-center gap-2 border-t border-[#d5e1ff] pt-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyMessage(message.text)}
+                            className="rounded-sm border border-[#b8c9fb] bg-white px-2 py-1 text-xs font-medium text-[#244aa8] hover:bg-[#f2f6ff]"
+                          >
+                            コピー
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleSaveMemo(message.text)}
+                            className="rounded-sm border border-[#b8c9fb] bg-white px-2 py-1 text-xs font-medium text-[#244aa8] hover:bg-[#f2f6ff]"
+                          >
+                            メモ保存
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )
@@ -1476,9 +1760,9 @@ export default function HomePage() {
                         <path d="M9 15h6" />
                       </svg>
                     </div>
-                    <div className="w-fit max-w-3xl rounded-[10px] border border-[#cfdcff] bg-[#eaf0ff] px-4 py-3 text-sm text-[#1f2a44] shadow-[3px_3px_0_0_#cfdcff]">
+                    <div className="w-fit max-w-3xl rounded-[10px] border border-[#cfdcff] bg-[#eaf0ff] px-4 py-3 text-base text-[#1f2a44] shadow-[3px_3px_0_0_#cfdcff]">
                       <p className="font-medium text-[#254086]">
-                        考え中{".".repeat(thinkingDots)}
+                        回答を作成しています{".".repeat(thinkingDots)}
                       </p>
                       <div className="mt-1 flex items-center gap-1">
                         <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#5a79e8]" />
@@ -1511,11 +1795,11 @@ export default function HomePage() {
                     value={question}
                     onChange={(event) => setQuestion(event.target.value)}
                     placeholder="PDF内容について質問してください"
-                    className="h-12 flex-1 rounded-sm border border-[#d7dae6] px-4 text-sm outline-none focus:border-[#6b739a]"
+                    className="h-12 flex-1 rounded-sm border border-[#d7dae6] px-4 text-base outline-none focus:border-[#6b739a]"
                   />
                   <button
                     disabled={sending}
-                    className="h-12 rounded-sm bg-[#1440e1] px-5 text-sm font-medium text-white disabled:opacity-60"
+                    className="h-12 rounded-sm bg-[#1440e1] px-5 text-base font-medium text-white disabled:opacity-60"
                   >
                     {sending ? "送信中..." : "送信"}
                   </button>
@@ -1733,6 +2017,68 @@ export default function HomePage() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      ) : null}
+
+      {showMemoModal ? (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
+          <div className="w-full max-w-3xl rounded-md border border-[#d7d8e2] bg-white p-5">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-base font-semibold text-[#2d2f39]">保存メモ一覧</h3>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleClearMemos()}
+                  disabled={savedMemos.length === 0}
+                  className="rounded-sm border border-[#e4c9cb] bg-[#fff6f7] px-3 py-2 text-xs text-[#ad2f3f] disabled:opacity-50"
+                >
+                  全削除
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowMemoModal(false)}
+                  className="rounded-sm border border-[#d5d7e3] px-3 py-2 text-xs text-[#4a4f60]"
+                >
+                  閉じる
+                </button>
+              </div>
+            </div>
+            <div className="mt-4 max-h-[60vh] space-y-3 overflow-auto">
+              {savedMemos.map((memo) => (
+                <article key={memo.id} className="rounded-sm border border-[#e2e5f0] bg-[#fbfcff] p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs text-[#6a748f]">
+                      {memo.createdAt ? memo.createdAt.toLocaleString("ja-JP") : "保存時刻不明"}
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleCopyMessage(memo.text)}
+                        className="rounded-sm border border-[#b8c9fb] bg-white px-2 py-1 text-xs font-medium text-[#244aa8] hover:bg-[#f2f6ff]"
+                      >
+                        コピー
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteMemo(memo.id)}
+                        className="rounded-sm border border-[#e4c9cb] bg-[#fff6f7] px-2 py-1 text-xs font-medium text-[#ad2f3f] hover:bg-[#ffedf0]"
+                      >
+                        削除
+                      </button>
+                    </div>
+                  </div>
+                  <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-[#2f354a]">
+                    {memo.text}
+                  </p>
+                </article>
+              ))}
+              {savedMemos.length === 0 ? (
+                <div className="rounded-sm border border-dashed border-[#d5d7e4] p-4 text-sm text-[#6f7280]">
+                  保存メモはまだありません
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
       ) : null}

@@ -44,6 +44,10 @@ service cloud.firestore {
         allow read, create, update, delete: if signedIn() && userId == uid();
       }
 
+      match /memos/{memoId} {
+        allow read, create, update, delete: if signedIn() && userId == uid();
+      }
+
       match /messages/{messageId} {
         allow read, create, update, delete: if signedIn() && userId == uid();
       }
