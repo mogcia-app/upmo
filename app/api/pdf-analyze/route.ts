@@ -1,14 +1,7 @@
 import { NextResponse } from "next/server";
 
-type PricingPlan = {
-  name: string;
-  priceMonthlyYen: number | null;
-  note: string;
-};
-
 type AnalyzeResult = {
   summary: string;
-  plans: PricingPlan[];
 };
 
 function sanitizeText(value: string): string {
@@ -23,51 +16,19 @@ function sanitizeText(value: string): string {
 }
 
 function fallbackAnalyze(text: string): AnalyzeResult {
-  const normalized = sanitizeText(text);
-  const summary = normalized.slice(0, 180) || "概要を抽出できませんでした。";
-  const planRegex = /([A-Za-zぁ-んァ-ヶ一-龠ー・\s]{1,20})\s*([0-9]{2,6}(?:,[0-9]{3})*)\s*円\s*\/?\s*月/g;
-  const plansMap = new Map<string, PricingPlan>();
-
-  let match = planRegex.exec(normalized);
-  while (match) {
-    const name = match[1].trim().replace(/\s+/g, " ");
-    const priceMonthlyYen = Number(match[2].replace(/,/g, ""));
-    const key = `${name}-${priceMonthlyYen}`;
-    if (!plansMap.has(key)) {
-      plansMap.set(key, {
-        name: name || "プラン",
-        priceMonthlyYen,
-        note: "",
-      });
-    }
-    match = planRegex.exec(normalized);
-  }
-
-  return {
-    summary,
-    plans: Array.from(plansMap.values()).slice(0, 8),
-  };
+  const summary = sanitizeText(text).slice(0, 180) || "概要を抽出できませんでした。";
+  return { summary };
 }
 
 function safeParseAnalyze(raw: string): AnalyzeResult | null {
   try {
     const parsed = JSON.parse(raw) as AnalyzeResult;
-    if (!parsed || typeof parsed.summary !== "string" || !Array.isArray(parsed.plans)) {
+    if (!parsed || typeof parsed.summary !== "string") {
       return null;
     }
 
-    const plans = parsed.plans
-      .map((plan) => ({
-        name: String(plan.name ?? "").trim(),
-        priceMonthlyYen:
-          typeof plan.priceMonthlyYen === "number" ? plan.priceMonthlyYen : null,
-        note: String(plan.note ?? "").trim(),
-      }))
-      .filter((plan) => plan.name.length > 0);
-
     return {
       summary: parsed.summary.trim(),
-      plans,
     };
   } catch {
     return null;
@@ -81,10 +42,7 @@ export async function POST(request: Request) {
     const text = sanitizeText(body.text ?? "");
 
     if (!text) {
-      return NextResponse.json(
-        { error: "text is required" },
-        { status: 400 },
-      );
+      return NextResponse.json({ error: "text is required" }, { status: 400 });
     }
 
     const apiKey = process.env.OPENAI_API_KEY;
@@ -96,9 +54,8 @@ export async function POST(request: Request) {
     const prompt = [
       `以下は「${fileName}」の抽出テキストです。`,
       "次のJSONだけを返してください。説明文は不要です。",
-      '{ "summary": "200文字以内の日本語要約", "plans": [{ "name": "プラン名", "priceMonthlyYen": 30000, "note": "補足" }] }',
-      "priceMonthlyYen は月額料金が不明なら null。",
-      "plans は重複なし。最大8件。",
+      '{ "summary": "200文字以内の日本語要約" }',
+      "料金・価格・プラン名の抽出や推測はしないでください。",
       "",
       text.slice(0, 22000),
     ].join("\n");
@@ -142,7 +99,7 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("[api/pdf-analyze] failed", error);
     return NextResponse.json(
-      { summary: "概要を抽出できませんでした。", plans: [] },
+      { summary: "概要を抽出できませんでした。" },
       { status: 200 },
     );
   }

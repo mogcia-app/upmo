@@ -21,7 +21,7 @@ service cloud.firestore {
 
       match /teams/{teamId} {
         allow read, create: if signedIn() && companyId == myCompanyId();
-        allow update, delete: if false;
+        allow update, delete: if signedIn() && companyId == myCompanyId();
       }
 
       match /teamInvites/{inviteId} {
@@ -42,6 +42,10 @@ service cloud.firestore {
 
       match /documents/{docId} {
         allow read, create, update, delete: if signedIn() && userId == uid();
+
+        match /comments/{commentId} {
+          allow read, create, update, delete: if signedIn() && userId == uid();
+        }
       }
 
       match /memos/{memoId} {

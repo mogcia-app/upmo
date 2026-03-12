@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { User, onAuthStateChanged, signOut } from "firebase/auth";
@@ -34,22 +35,6 @@ type UserProfile = {
   role: "owner" | "member";
 };
 
-type CompanyMember = {
-  uid: string;
-  email: string;
-  displayName: string;
-};
-
-type TeamItem = {
-  id: string;
-  name: string;
-  memberUids: string[];
-};
-
-type ActiveChat =
-  | { type: "personal" }
-  | { type: "team"; teamId: string };
-
 type ChatThread = {
   id: string;
   scopeType: "personal" | "team";
@@ -63,7 +48,7 @@ type SourceItem = {
   name: string;
   text: string;
   summary?: string;
-  pricingPlans?: PricingPlan[];
+  updateMemo?: string;
   storagePath?: string;
   inheritedFromDocumentId?: string;
   createdAt?: Date;
@@ -82,12 +67,6 @@ type SavedMemo = {
   createdAt?: Date;
 };
 
-type PricingPlan = {
-  name: string;
-  priceMonthlyYen: number | null;
-  note: string;
-};
-
 type UploadStatus = {
   fileName: string;
   progress: number;
@@ -98,8 +77,24 @@ type SelectedKnowledge = {
   name: string;
 };
 
+type KnowledgeComment = {
+  id: string;
+  text: string;
+  authorName: string;
+  createdAt?: Date;
+};
+
 function normalizeText(value: string): string {
   return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function normalizeKnowledgeName(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\.[a-z0-9]{1,8}$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function sanitizeExtractedText(value: string): string {
@@ -116,6 +111,12 @@ function sanitizeExtractedText(value: string): string {
 function toDate(value: unknown): Date | undefined {
   if (value instanceof Timestamp) return value.toDate();
   return undefined;
+}
+
+function isStorageObjectNotFound(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: string };
+  return candidate.code === "storage/object-not-found";
 }
 
 async function extractPdfText(file: File): Promise<string> {
@@ -141,16 +142,25 @@ async function extractPdfText(file: File): Promise<string> {
 }
 
 function extractPriceLines(text: string): string[] {
-  const lines = sanitizeExtractedText(text)
-    .split(/(?<=円\s*\/?\s*月)/g)
-    .map((line) => line.trim())
-    .filter(Boolean);
+  const normalized = sanitizeExtractedText(text);
+  if (!normalized) return [];
 
-  const priceLike = lines.filter((line) =>
-    /([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{2,6})\s*円\s*\/?\s*月/.test(line),
-  );
+  const matches: string[] = [];
+  const idPriceRegex = /([0-9０-９]+ID)\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{2,6})円\s*\/\s*([0-9０-９]+ID)/g;
+  const contactRegex = /([0-9０-９]+ID\s*[〜~\-]*)\s*(お問い合わせください)/g;
+  const monthlyRegex = /([A-Za-zぁ-んァ-ヶ一-龠ー・]{1,20})\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{2,6})円\s*\/\s*(月|月額)/g;
 
-  return Array.from(new Set(priceLike)).slice(0, 5);
+  for (const match of normalized.matchAll(idPriceRegex)) {
+    matches.push(`${match[1]} ${match[2]}円 / ${match[3]}`);
+  }
+  for (const match of normalized.matchAll(contactRegex)) {
+    matches.push(`${match[1].trim()} ${match[2]}`);
+  }
+  for (const match of normalized.matchAll(monthlyRegex)) {
+    matches.push(`${match[1].trim()} ${match[2]}円 / ${match[3]}`);
+  }
+
+  return Array.from(new Set(matches)).slice(0, 6);
 }
 
 function buildAssistantReply(question: string, sources: SourceItem[]): string {
@@ -166,33 +176,19 @@ function buildAssistantReply(question: string, sources: SourceItem[]): string {
 
   const isPriceQuestion = /料金|価格|費用|プラン|月額|値段/.test(question);
   if (isPriceQuestion) {
-    const structuredPlans = sources
-      .flatMap((source) => source.pricingPlans ?? [])
-      .filter((plan) => plan.name.length > 0);
-
-    if (structuredPlans.length > 0) {
-      const deduped = Array.from(
-        new Map(
-          structuredPlans.map((plan) => [
-            `${plan.name}-${plan.priceMonthlyYen ?? "null"}`,
-            plan,
-          ]),
-        ).values(),
-      );
-      const priceLines = deduped.map((plan) => {
-        const amount =
-          typeof plan.priceMonthlyYen === "number"
-            ? `${plan.priceMonthlyYen.toLocaleString("ja-JP")}円/月`
-            : "価格不明";
-        return `${plan.name}: ${amount}${plan.note ? `（${plan.note}）` : ""}`;
-      });
-      return `料金情報:\n${priceLines.join("\n")}`;
-    }
-
-    const prices = sources.flatMap((source) => extractPriceLines(source.text));
+    const prices = sources.flatMap((source) =>
+      extractPriceLines([source.updateMemo ?? "", source.text].join(" ")).map((line) => `${source.name}: ${line}`),
+    );
     if (prices.length > 0) {
-      return `料金情報:\n${prices.join("\n")}`;
+      return [
+        "料金",
+        ...prices.map((line) => `・${line}`),
+      ].join("\n");
     }
+    return [
+      "本文内に料金情報は確認できませんでした。",
+      "料金表や価格記載のある本文があれば、その内容だけで再回答できます。",
+    ].join("\n");
   }
 
   let bestSource: SourceItem | null = null;
@@ -200,7 +196,8 @@ function buildAssistantReply(question: string, sources: SourceItem[]): string {
   let bestSnippet = "";
 
   for (const source of sources) {
-    const normalizedSource = normalizeText(source.text);
+    const mergedText = [source.updateMemo ?? "", source.text].filter(Boolean).join(" ");
+    const normalizedSource = normalizeText(mergedText);
     if (!normalizedSource) continue;
 
     let score = 0;
@@ -218,21 +215,29 @@ function buildAssistantReply(question: string, sources: SourceItem[]): string {
       bestSource = source;
       if (firstHitIndex >= 0) {
         const start = Math.max(0, firstHitIndex - 80);
-        const end = Math.min(source.text.length, firstHitIndex + 220);
-        bestSnippet = source.text.slice(start, end).replace(/\s+/g, " ").trim();
+        const end = Math.min(mergedText.length, firstHitIndex + 220);
+        bestSnippet = mergedText.slice(start, end).replace(/\s+/g, " ").trim();
       } else {
-        bestSnippet = source.text.slice(0, 220).replace(/\s+/g, " ").trim();
+        bestSnippet = mergedText.slice(0, 220).replace(/\s+/g, " ").trim();
       }
     }
   }
 
   if (!bestSource) return "回答に使えるテキストを見つけられませんでした。";
 
+  if (bestSource.updateMemo && bestScore <= 0) {
+    return `${bestSource.name} の変更メモ: ${bestSource.updateMemo}`;
+  }
+
   if (bestSource.summary && bestScore <= 0) {
     return `${bestSource.name} の概要: ${bestSource.summary}`;
   }
 
   return `「${bestSource.name}」を参照: ${bestSnippet}`;
+}
+
+function hasAppliedUpdateMemo(sources: SourceItem[]): boolean {
+  return sources.some((source) => Boolean(source.updateMemo?.trim()));
 }
 
 function pickRelevantSourceNames(question: string, sources: SourceItem[], limitCount = 3): string[] {
@@ -273,21 +278,6 @@ function formatAssistantMessage(text: string): string {
     .trim();
 }
 
-function parsePricingPlans(value: unknown): PricingPlan[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item) => {
-      const plan = item as Partial<PricingPlan>;
-      return {
-        name: String(plan.name ?? "").trim(),
-        priceMonthlyYen:
-          typeof plan.priceMonthlyYen === "number" ? plan.priceMonthlyYen : null,
-        note: String(plan.note ?? "").trim(),
-      };
-    })
-    .filter((plan) => plan.name.length > 0);
-}
-
 function buildPersonalChatLabel(date: Date): string {
   return `${date.getMonth() + 1}月${date.getDate()}日のチャット`;
 }
@@ -296,27 +286,15 @@ function formatChatThreadLabel(thread: ChatThread): string {
   return buildPersonalChatLabel(thread.createdAt ?? new Date());
 }
 
-function buildPdfSummaryMessage(fileName: string, summary: string, plans: PricingPlan[]): string {
+function buildPdfSummaryMessage(fileName: string, summary: string): string {
   const summaryLine = summary.trim() || "概要を抽出できませんでした。";
-  const planLine =
-    plans.length > 0
-      ? `料金: ${plans
-          .map((plan) => {
-            const amount =
-              typeof plan.priceMonthlyYen === "number"
-                ? `${plan.priceMonthlyYen.toLocaleString("ja-JP")}円/月`
-                : "価格不明";
-            return `${plan.name} ${amount}`;
-          })
-          .join(" / ")}`
-      : "料金: 抽出なし";
-  return `「${fileName}」をアップロードしました。\n概要: ${summaryLine}\n${planLine}`;
+  return `「${fileName}」をアップロードしました。\n概要: ${summaryLine}`;
 }
 
 async function analyzePdfText(
   fileName: string,
   text: string,
-): Promise<{ summary: string; plans: PricingPlan[] }> {
+): Promise<{ summary: string }> {
   const response = await fetch("/api/pdf-analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -327,10 +305,9 @@ async function analyzePdfText(
     throw new Error(`analyze failed: ${response.status}`);
   }
 
-  const data = (await response.json()) as { summary?: string; plans?: unknown };
+  const data = (await response.json()) as { summary?: string };
   return {
     summary: String(data.summary ?? "").trim(),
-    plans: parsePricingPlans(data.plans),
   };
 }
 
@@ -365,7 +342,7 @@ async function generateAiReply(params: {
         name: source.name,
         summary: source.summary ?? "",
         text: source.text,
-        pricingPlans: source.pricingPlans ?? [],
+        updateMemo: source.updateMemo ?? "",
       })),
     }),
   });
@@ -387,27 +364,16 @@ export default function HomePage() {
   const [showKnowledgeMenu, setShowKnowledgeMenu] = useState(false);
   const [showTextModal, setShowTextModal] = useState(false);
   const [showUrlModal, setShowUrlModal] = useState(false);
-  const [showInviteModal, setShowInviteModal] = useState(false);
-  const [showTeamChatModal, setShowTeamChatModal] = useState(false);
-  const [teamName, setTeamName] = useState("");
-  const [teamSubmitting, setTeamSubmitting] = useState(false);
-  const [companyMembers, setCompanyMembers] = useState<CompanyMember[]>([]);
-  const [teams, setTeams] = useState<TeamItem[]>([]);
-  const [selectedMemberUids, setSelectedMemberUids] = useState<string[]>([]);
-  const [activeChat, setActiveChat] = useState<ActiveChat>({ type: "personal" });
   const [textTitle, setTextTitle] = useState("");
   const [textBody, setTextBody] = useState("");
   const [urlInput, setUrlInput] = useState("");
   const [urlSubmitting, setUrlSubmitting] = useState(false);
-  const [inviteEmail, setInviteEmail] = useState("");
-  const [inviteSubmitting, setInviteSubmitting] = useState(false);
   const [deletingSourceId, setDeletingSourceId] = useState<string | null>(null);
-  const [showUploadedList, setShowUploadedList] = useState(false);
+  const [deletingChatId, setDeletingChatId] = useState<string | null>(null);
   const [selectedKnowledge, setSelectedKnowledge] = useState<SelectedKnowledge | null>(null);
   const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
   const [creatingChat, setCreatingChat] = useState(false);
-  const [inheritSourceIds, setInheritSourceIds] = useState<string[]>([]);
   const [sending, setSending] = useState(false);
   const [thinkingDots, setThinkingDots] = useState(1);
   const [question, setQuestion] = useState("");
@@ -417,8 +383,16 @@ export default function HomePage() {
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [showMemoModal, setShowMemoModal] = useState(false);
   const [savedMemos, setSavedMemos] = useState<SavedMemo[]>([]);
+  const [showPersonalSection, setShowPersonalSection] = useState(true);
+  const [commentText, setCommentText] = useState("");
+  const [comments, setComments] = useState<KnowledgeComment[]>([]);
+  const [commentSubmitting, setCommentSubmitting] = useState(false);
+  const [deletingCommentId, setDeletingCommentId] = useState<string | null>(null);
+  const [updateMemoDraft, setUpdateMemoDraft] = useState("");
+  const [updateMemoSubmitting, setUpdateMemoSubmitting] = useState(false);
   const pdfInputRef = useRef<HTMLInputElement | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  const pendingAssistantCountRef = useRef<number | null>(null);
   const logError = (context: string, error: unknown) => {
     if (error instanceof Error) {
       console.error(`[home] ${context}:`, error.message);
@@ -475,16 +449,19 @@ export default function HomePage() {
       limit(20),
     );
     const unsub = onSnapshot(docsQuery, (snapshot) => {
-      const next = snapshot.docs.map((snap) => ({
-        id: snap.id,
-        name: String(snap.data().name ?? "Untitled PDF"),
-        text: String(snap.data().text ?? ""),
-        summary: String(snap.data().summary ?? ""),
-        pricingPlans: parsePricingPlans(snap.data().pricingPlans),
-        storagePath: String(snap.data().storagePath ?? ""),
-        inheritedFromDocumentId: String(snap.data().inheritedFromDocumentId ?? ""),
-        createdAt: toDate(snap.data().createdAt),
-      }));
+      const next = snapshot.docs.map((snap) => {
+        const text = String(snap.data().text ?? "");
+        return {
+          id: snap.id,
+          name: String(snap.data().name ?? "Untitled PDF"),
+          text,
+          summary: String(snap.data().summary ?? ""),
+          updateMemo: String(snap.data().updateMemo ?? ""),
+          storagePath: String(snap.data().storagePath ?? ""),
+          inheritedFromDocumentId: String(snap.data().inheritedFromDocumentId ?? ""),
+          createdAt: toDate(snap.data().createdAt),
+        };
+      });
       setGlobalSources(next);
     }, (snapshotError) => logError("documents-snapshot", snapshotError));
 
@@ -497,96 +474,8 @@ export default function HomePage() {
       return;
     }
 
-    if (activeChat.type === "team") {
-      if (!selectedChatId) {
-        setSources([]);
-        return;
-      }
-
-      const teamDocsQuery = query(
-        collection(db, "users", authUser.uid, "chats", selectedChatId, "documents"),
-        orderBy("createdAt", "desc"),
-        limit(50),
-      );
-      const unsub = onSnapshot(teamDocsQuery, (snapshot) => {
-        const next = snapshot.docs.map((snap) => ({
-          id: snap.id,
-          name: String(snap.data().name ?? "Untitled"),
-          text: String(snap.data().text ?? ""),
-          summary: String(snap.data().summary ?? ""),
-          pricingPlans: parsePricingPlans(snap.data().pricingPlans),
-          storagePath: String(snap.data().storagePath ?? ""),
-          inheritedFromDocumentId: String(snap.data().inheritedFromDocumentId ?? ""),
-          createdAt: toDate(snap.data().createdAt),
-        }));
-        setSources(next);
-      }, (snapshotError) => logError("team-documents-snapshot", snapshotError));
-
-      return () => unsub();
-    }
-
     setSources(globalSources);
-  }, [authUser, activeChat.type, selectedChatId, globalSources]);
-
-  useEffect(() => {
-    if (!profile?.companyId) {
-      setCompanyMembers([]);
-      return;
-    }
-
-    const membersQuery = query(
-      collection(db, "users"),
-      where("companyId", "==", profile.companyId),
-      limit(50),
-    );
-    const unsub = onSnapshot(
-      membersQuery,
-      (snapshot) => {
-        const next = snapshot.docs
-          .map((memberDoc) => ({
-            uid: memberDoc.id,
-            email: String(memberDoc.data().email ?? ""),
-            displayName: String(memberDoc.data().displayName ?? memberDoc.data().email ?? memberDoc.id),
-          }))
-          .sort((a, b) => a.displayName.localeCompare(b.displayName, "ja"));
-        setCompanyMembers(next);
-      },
-      (snapshotError) => logError("company-members-snapshot", snapshotError),
-    );
-
-    return () => unsub();
-  }, [profile?.companyId]);
-
-  useEffect(() => {
-    if (!authUser || !profile?.companyId) {
-      setTeams([]);
-      return;
-    }
-
-    const teamsQuery = query(
-      collection(db, "companies", profile.companyId, "teams"),
-      where("memberUids", "array-contains", authUser.uid),
-      limit(30),
-    );
-    const unsub = onSnapshot(
-      teamsQuery,
-      (snapshot) => {
-        const next = snapshot.docs
-          .map((teamDoc) => ({
-            id: teamDoc.id,
-            name: String(teamDoc.data().name ?? "無題のチーム"),
-            memberUids: Array.isArray(teamDoc.data().memberUids)
-              ? (teamDoc.data().memberUids as string[])
-              : [],
-          }))
-          .sort((a, b) => a.name.localeCompare(b.name, "ja"));
-        setTeams(next);
-      },
-      (snapshotError) => logError("teams-snapshot", snapshotError),
-    );
-
-    return () => unsub();
-  }, [authUser, profile?.companyId]);
+  }, [authUser, globalSources]);
 
   useEffect(() => {
     if (!authUser) {
@@ -594,17 +483,9 @@ export default function HomePage() {
       setSelectedChatId(null);
       return;
     }
-    if (activeChat.type === "team" && !activeChat.teamId) {
-      setChatThreads([]);
-      setSelectedChatId(null);
-      return;
-    }
 
     const chatsRef = collection(db, "users", authUser.uid, "chats");
-    const chatsQuery =
-      activeChat.type === "team"
-        ? query(chatsRef, where("scopeType", "==", "team"), where("teamId", "==", activeChat.teamId))
-        : query(chatsRef, where("scopeType", "==", "personal"));
+    const chatsQuery = query(chatsRef, where("scopeType", "==", "personal"));
 
     const unsub = onSnapshot(
       chatsQuery,
@@ -632,37 +513,29 @@ export default function HomePage() {
     );
 
     return () => unsub();
-  }, [authUser, activeChat]);
+  }, [authUser]);
 
   const selectedSource = useMemo(
     () => (selectedKnowledge ? sources.find((source) => source.id === selectedKnowledge.id) ?? null : null),
     [selectedKnowledge, sources],
   );
-  const selectedKnowledgeLabel = selectedSource?.name ?? selectedKnowledge?.name ?? null;
-  const selectedTeam = useMemo(
-    () => (activeChat.type === "team" ? teams.find((team) => team.id === activeChat.teamId) ?? null : null),
-    [activeChat, teams],
-  );
-  const selectedThread = useMemo(
-    () => (selectedChatId ? chatThreads.find((thread) => thread.id === selectedChatId) ?? null : null),
-    [selectedChatId, chatThreads],
-  );
-  const chatTitle = activeChat.type === "team" && selectedTeam
-    ? `${selectedTeam.name}のチャット`
-    : formatChatThreadLabel(selectedThread ?? { id: "default", scopeType: "personal", createdAt: new Date() });
-
-  useEffect(() => {
-    if (activeChat.type !== "team") return;
-    const stillExists = teams.some((team) => team.id === activeChat.teamId);
-    if (!stillExists) {
-      setActiveChat({ type: "personal" });
-    }
-  }, [activeChat, teams]);
+  const chatTitle = "パーソナルチャット";
 
   useEffect(() => {
     if (!messagesContainerRef.current) return;
     messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
   }, [messages, uploading]);
+
+  useEffect(() => {
+    if (!sending) return;
+    const expectedAssistantCount = pendingAssistantCountRef.current;
+    if (expectedAssistantCount == null) return;
+    const currentAssistantCount = messages.filter((message) => message.sender === "assistant").length;
+    if (currentAssistantCount >= expectedAssistantCount) {
+      pendingAssistantCountRef.current = null;
+      setSending(false);
+    }
+  }, [messages, sending]);
 
   useEffect(() => {
     if (!sending) {
@@ -684,7 +557,38 @@ export default function HomePage() {
   }, [sources, selectedKnowledge]);
 
   useEffect(() => {
-    if (!authUser || !showMemoModal) {
+    setUpdateMemoDraft(selectedSource?.updateMemo ?? "");
+  }, [selectedSource]);
+
+  useEffect(() => {
+    if (!authUser || !selectedSource) {
+      setComments([]);
+      return;
+    }
+
+    const commentsQuery = query(
+      collection(db, "users", authUser.uid, "documents", selectedSource.id, "comments"),
+      orderBy("createdAt", "desc"),
+      limit(100),
+    );
+    const unsub = onSnapshot(
+      commentsQuery,
+      (snapshot) => {
+        const next = snapshot.docs.map((commentDoc) => ({
+          id: commentDoc.id,
+          text: String(commentDoc.data().text ?? ""),
+          authorName: String(commentDoc.data().authorName ?? "投稿者不明"),
+          createdAt: toDate(commentDoc.data().createdAt),
+        }));
+        setComments(next);
+      },
+      (snapshotError) => logError("comments-snapshot", snapshotError),
+    );
+    return () => unsub();
+  }, [authUser, selectedSource]);
+
+  useEffect(() => {
+    if (!authUser) {
       setSavedMemos([]);
       return;
     }
@@ -706,7 +610,7 @@ export default function HomePage() {
       (snapshotError) => logError("memos-snapshot", snapshotError),
     );
     return () => unsub();
-  }, [authUser, showMemoModal]);
+  }, [authUser]);
 
   useEffect(() => {
     if (!actionNotice) return;
@@ -739,14 +643,13 @@ export default function HomePage() {
 
   const createNewChatThread = async (): Promise<string | null> => {
     if (!authUser) return null;
-    if (activeChat.type === "team" && !selectedTeam) return null;
 
     setCreatingChat(true);
     try {
       const created = await addDoc(collection(db, "users", authUser.uid, "chats"), {
-        scopeType: activeChat.type,
-        teamId: activeChat.type === "team" ? selectedTeam?.id ?? "" : "",
-        teamName: activeChat.type === "team" ? selectedTeam?.name ?? "" : "",
+        scopeType: "personal",
+        teamId: "",
+        teamName: "",
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -760,69 +663,28 @@ export default function HomePage() {
     }
   };
 
-  const createTeamChatWithInheritance = async (sourceIds: string[]): Promise<string | null> => {
-    if (!authUser || !selectedTeam) return null;
-
-    setCreatingChat(true);
-    try {
-      const created = await addDoc(collection(db, "users", authUser.uid, "chats"), {
-        scopeType: "team",
-        teamId: selectedTeam.id,
-        teamName: selectedTeam.name,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-
-      const inheritTargets = globalSources.filter((source) => sourceIds.includes(source.id));
-      for (const source of inheritTargets) {
-        await addDoc(collection(db, "users", authUser.uid, "chats", created.id, "documents"), {
-          name: source.name,
-          text: source.text,
-          summary: source.summary ?? "",
-          pricingPlans: source.pricingPlans ?? [],
-          storagePath: source.storagePath ?? "",
-          inheritedFromDocumentId: source.id,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      setSelectedChatId(created.id);
-      return created.id;
-    } catch (error) {
-      logError("team-chat-create", error);
-      return null;
-    } finally {
-      setCreatingChat(false);
-    }
-  };
-
   const ensureActiveChatId = async (): Promise<string | null> => {
     if (selectedChatId) return selectedChatId;
     return createNewChatThread();
   };
 
-  const handleCreateNewChat = async () => {
-    if (activeChat.type === "team") {
-      setInheritSourceIds([]);
-      setShowTeamChatModal(true);
-      return;
+  const handleCreatePersonalChat = async () => {
+    if (!authUser) return;
+    setCreatingChat(true);
+    try {
+      const created = await addDoc(collection(db, "users", authUser.uid, "chats"), {
+        scopeType: "personal",
+        teamId: "",
+        teamName: "",
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      setSelectedChatId(created.id);
+    } catch (error) {
+      logError("personal-chat-create", error);
+    } finally {
+      setCreatingChat(false);
     }
-    await createNewChatThread();
-  };
-
-  const toggleInheritSource = (sourceId: string) => {
-    setInheritSourceIds((prev) =>
-      prev.includes(sourceId) ? prev.filter((id) => id !== sourceId) : [...prev, sourceId],
-    );
-  };
-
-  const handleTeamChatCreateSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const createdId = await createTeamChatWithInheritance(inheritSourceIds);
-    if (!createdId) return;
-    setInheritSourceIds([]);
-    setShowTeamChatModal(false);
   };
 
   const handleKnowledgeUpload = async (
@@ -856,10 +718,7 @@ export default function HomePage() {
             ? await extractPdfText(file)
             : sanitizeExtractedText(await file.text());
         const analysis = await analyzePdfText(file.name, text);
-        const storagePath =
-          activeChat.type === "team"
-            ? `users/${authUser.uid}/chats/${activeId}/documents/${Date.now()}-${file.name}`
-            : `users/${authUser.uid}/documents/${Date.now()}-${file.name}`;
+        const storagePath = `users/${authUser.uid}/documents/${Date.now()}-${file.name}`;
         const objectRef = ref(storage, storagePath);
         setUploadStatus({ fileName: file.name, progress: 0 });
         await new Promise<void>((resolve, reject) => {
@@ -880,21 +739,16 @@ export default function HomePage() {
           name: file.name,
           text,
           summary: analysis.summary,
-          pricingPlans: analysis.plans,
           storagePath,
           downloadURL,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         };
-        if (activeChat.type === "team") {
-          await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "documents"), docPayload);
-        } else {
-          await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
-        }
+        await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
 
         await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
           sender: "assistant",
-          text: buildPdfSummaryMessage(file.name, analysis.summary, analysis.plans),
+          text: buildPdfSummaryMessage(file.name, analysis.summary),
           createdAt: serverTimestamp(),
         });
         await updateDoc(doc(db, "users", authUser.uid, "chats", activeId), {
@@ -937,22 +791,17 @@ export default function HomePage() {
         name: `${title}.txt`,
         text: body,
         summary: analysis.summary,
-        pricingPlans: analysis.plans,
         storagePath: "",
         downloadURL: "",
         sourceType: "text",
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      if (activeChat.type === "team") {
-        await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "documents"), docPayload);
-      } else {
-        await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
-      }
+      await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
 
       await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
         sender: "assistant",
-        text: buildPdfSummaryMessage(`${title}.txt`, analysis.summary, analysis.plans),
+        text: buildPdfSummaryMessage(`${title}.txt`, analysis.summary),
         createdAt: serverTimestamp(),
       });
       await updateDoc(doc(db, "users", authUser.uid, "chats", activeId), {
@@ -995,7 +844,6 @@ export default function HomePage() {
         name: extracted.title || url,
         text: extracted.text,
         summary: analysis.summary,
-        pricingPlans: analysis.plans,
         sourceType: "url",
         sourceUrl: url,
         storagePath: "",
@@ -1003,15 +851,11 @@ export default function HomePage() {
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      if (activeChat.type === "team") {
-        await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "documents"), docPayload);
-      } else {
-        await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
-      }
+      await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
 
       await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
         sender: "assistant",
-        text: buildPdfSummaryMessage(extracted.title || url, analysis.summary, analysis.plans),
+        text: buildPdfSummaryMessage(extracted.title || url, analysis.summary),
         createdAt: serverTimestamp(),
       });
       await updateDoc(doc(db, "users", authUser.uid, "chats", activeId), {
@@ -1037,6 +881,7 @@ export default function HomePage() {
 
     const userQuestion = question.trim();
     setQuestion("");
+    pendingAssistantCountRef.current = messages.filter((message) => message.sender === "assistant").length + 1;
     setSending(true);
     try {
       await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
@@ -1046,6 +891,7 @@ export default function HomePage() {
       });
 
       const targetSources = selectedSource ? [selectedSource] : sources;
+      const usedUpdateMemo = hasAppliedUpdateMemo(targetSources);
       let assistantReply = "";
       try {
         assistantReply = await generateAiReply({
@@ -1065,6 +911,9 @@ export default function HomePage() {
           referenceNames.length > 0 ? referenceNames.join(" / ") : "なし"
         }`;
       }
+      if (usedUpdateMemo && !assistantReply.includes("変更メモを反映")) {
+        assistantReply = `${assistantReply}\n変更メモを反映`;
+      }
       await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
         sender: "assistant",
         text: assistantReply,
@@ -1075,6 +924,8 @@ export default function HomePage() {
       });
     } catch (chatError) {
       logError("chat-send", chatError);
+      pendingAssistantCountRef.current = null;
+      setSending(false);
       try {
         await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
           sender: "assistant",
@@ -1084,40 +935,83 @@ export default function HomePage() {
       } catch (fallbackError) {
         logError("chat-fallback", fallbackError);
       }
-    } finally {
-      setSending(false);
     }
   };
 
   const handleDeleteSource = async (source: SourceItem) => {
     if (!authUser) return;
-    if (activeChat.type === "team" && !selectedChatId) return;
     const shouldDelete = window.confirm(`「${source.name}」を削除しますか？`);
     if (!shouldDelete) return;
 
     setDeletingSourceId(source.id);
     try {
-      const deletingTeamLocalSource = activeChat.type === "team" && !source.inheritedFromDocumentId;
-      if (source.storagePath && (activeChat.type !== "team" || deletingTeamLocalSource)) {
+      if (source.storagePath) {
         try {
           await deleteObject(ref(storage, source.storagePath));
         } catch (storageError) {
-          logError("delete-source-storage", storageError);
+          if (!isStorageObjectNotFound(storageError)) {
+            logError("delete-source-storage", storageError);
+          }
         }
       }
-      if (activeChat.type === "team") {
-        if (!selectedChatId) return;
-        await deleteDoc(doc(db, "users", authUser.uid, "chats", selectedChatId, "documents", source.id));
-      } else {
-        await deleteDoc(doc(db, "users", authUser.uid, "documents", source.id));
-      }
+      const commentsSnap = await getDocs(collection(db, "users", authUser.uid, "documents", source.id, "comments"));
+      await Promise.all(commentsSnap.docs.map((commentDoc) => deleteDoc(commentDoc.ref)));
+      await deleteDoc(doc(db, "users", authUser.uid, "documents", source.id));
       if (selectedKnowledge?.id === source.id) {
         setSelectedKnowledge(null);
+        setCommentText("");
       }
     } catch (deleteError) {
       logError("delete-source", deleteError);
     } finally {
       setDeletingSourceId(null);
+    }
+  };
+
+  const deleteChatThreadInternal = async (thread: ChatThread) => {
+    if (!authUser) return;
+    try {
+      const chatRef = doc(db, "users", authUser.uid, "chats", thread.id);
+      const messagesSnap = await getDocs(collection(db, "users", authUser.uid, "chats", thread.id, "messages"));
+      await Promise.all(messagesSnap.docs.map((messageDoc) => deleteDoc(messageDoc.ref)));
+
+      const documentsSnap = await getDocs(collection(db, "users", authUser.uid, "chats", thread.id, "documents"));
+      for (const documentDoc of documentsSnap.docs) {
+        const data = documentDoc.data();
+        const storagePath = String(data.storagePath ?? "");
+        const inheritedFromDocumentId = String(data.inheritedFromDocumentId ?? "");
+        if (storagePath && !inheritedFromDocumentId) {
+          try {
+            await deleteObject(ref(storage, storagePath));
+          } catch (storageError) {
+            if (!isStorageObjectNotFound(storageError)) {
+              logError("delete-chat-thread-storage", storageError);
+            }
+          }
+        }
+        await deleteDoc(documentDoc.ref);
+      }
+
+      await deleteDoc(chatRef);
+      if (selectedChatId === thread.id) {
+        setSelectedChatId(null);
+      }
+      setActionNotice("チャット履歴を削除しました。");
+    } catch (error) {
+      logError("delete-chat-thread", error);
+    }
+  };
+
+  const handleDeleteChatThread = async (thread: ChatThread) => {
+    if (!authUser) return;
+    const shouldDelete = window.confirm(`「${formatChatThreadLabel(thread)}」を削除しますか？`);
+    if (!shouldDelete) return;
+
+    setDeletingChatId(thread.id);
+    try {
+      await deleteChatThreadInternal(thread);
+    } finally {
+      setDeletingChatId(null);
     }
   };
 
@@ -1164,6 +1058,13 @@ export default function HomePage() {
     }
   };
 
+  const handleReuseMemo = (text: string) => {
+    const normalized = text.trim();
+    if (!normalized) return;
+    setQuestion((prev) => (prev.trim() ? `${prev.trim()}\n\n${normalized}` : normalized));
+    setActionNotice("メモを入力欄に追加しました。");
+  };
+
   const handleClearMemos = async () => {
     if (!authUser) return;
     const shouldDelete = window.confirm("メモをすべて削除しますか？");
@@ -1178,6 +1079,56 @@ export default function HomePage() {
       setActionNotice("メモをすべて削除しました。");
     } catch (error) {
       logError("clear-memos", error);
+    }
+  };
+
+  const handleSubmitComment = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!authUser || !profile || !selectedSource || !commentText.trim()) return;
+
+    setCommentSubmitting(true);
+    try {
+      await addDoc(collection(db, "users", authUser.uid, "documents", selectedSource.id, "comments"), {
+        text: commentText.trim(),
+        authorName: profile.displayName,
+        authorUid: authUser.uid,
+        createdAt: serverTimestamp(),
+      });
+      setCommentText("");
+      setActionNotice("コメントを追加しました。");
+    } catch (error) {
+      logError("comment-submit", error);
+    } finally {
+      setCommentSubmitting(false);
+    }
+  };
+
+  const handleDeleteComment = async (commentId: string) => {
+    if (!authUser || !selectedSource) return;
+    setDeletingCommentId(commentId);
+    try {
+      await deleteDoc(doc(db, "users", authUser.uid, "documents", selectedSource.id, "comments", commentId));
+      setActionNotice("コメントを削除しました。");
+    } catch (error) {
+      logError("comment-delete", error);
+    } finally {
+      setDeletingCommentId(null);
+    }
+  };
+
+  const handleSaveUpdateMemo = async () => {
+    if (!authUser || !selectedSource) return;
+    setUpdateMemoSubmitting(true);
+    try {
+      await updateDoc(doc(db, "users", authUser.uid, "documents", selectedSource.id), {
+        updateMemo: updateMemoDraft.trim(),
+        updatedAt: serverTimestamp(),
+      });
+      setActionNotice("変更メモを保存しました。");
+    } catch (error) {
+      logError("update-memo-save", error);
+    } finally {
+      setUpdateMemoSubmitting(false);
     }
   };
 
@@ -1270,7 +1221,15 @@ export default function HomePage() {
               <div key={`line-${index}`} className="flex flex-wrap items-center gap-1 text-sm text-[#465272]">
                 <span>参照ナレッジ:</span>
                 {names.map((name, nameIndex) => {
-                  const matched = sources.find((source) => source.name === name);
+                  const normalizedName = normalizeKnowledgeName(name);
+                  const matched = sources.find((source) => {
+                    const sourceName = normalizeKnowledgeName(source.name);
+                    return (
+                      sourceName === normalizedName ||
+                      sourceName.includes(normalizedName) ||
+                      normalizedName.includes(sourceName)
+                    );
+                  });
                   if (matched) {
                     return (
                       <button
@@ -1278,9 +1237,8 @@ export default function HomePage() {
                         type="button"
                         onClick={() => {
                           setSelectedKnowledge({ id: matched.id, name: matched.name });
-                          setShowUploadedList(true);
                         }}
-                        className="rounded-sm border border-[#bdd0ff] bg-white px-2 py-0.5 text-xs font-medium text-[#1d46a6] hover:bg-[#eef4ff]"
+                        className="border border-[#bdd0ff] bg-white px-2 py-0.5 text-xs font-medium text-[#1d46a6] hover:bg-[#eef4ff]"
                       >
                         {name}
                       </button>
@@ -1307,98 +1265,6 @@ export default function HomePage() {
     router.replace("/login");
   };
 
-  const openInviteModal = () => {
-    setTeamName("");
-    setInviteEmail("");
-    setSelectedMemberUids(authUser ? [authUser.uid] : []);
-    setShowInviteModal(true);
-  };
-
-  const closeInviteModal = () => {
-    if (inviteSubmitting || teamSubmitting) return;
-    setTeamName("");
-    setInviteEmail("");
-    setSelectedMemberUids([]);
-    setShowInviteModal(false);
-  };
-
-  const toggleMemberSelection = (memberUid: string) => {
-    setSelectedMemberUids((prev) =>
-      prev.includes(memberUid) ? prev.filter((uid) => uid !== memberUid) : [...prev, memberUid],
-    );
-  };
-
-  const handleCreateTeam = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!authUser || !profile?.companyId) return;
-
-    const normalizedName = teamName.trim();
-    if (!normalizedName) {
-      logError("team-create", "チーム名を入力してください。");
-      return;
-    }
-
-    const memberUids = Array.from(new Set([authUser.uid, ...selectedMemberUids]));
-
-    setTeamSubmitting(true);
-    try {
-      await addDoc(collection(db, "companies", profile.companyId, "teams"), {
-        companyId: profile.companyId,
-        companyName: profile.companyName,
-        name: normalizedName,
-        memberUids,
-        memberCount: memberUids.length,
-        createdByUid: authUser.uid,
-        createdByName: profile.displayName,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      setTeamName("");
-      setSelectedMemberUids([authUser.uid]);
-      setShowInviteModal(false);
-    } catch (error) {
-      logError("team-create-submit", error);
-    } finally {
-      setTeamSubmitting(false);
-    }
-  };
-
-  const handleInviteSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!authUser || !profile) return;
-    if (!profile.companyId) {
-      logError("team-invite", "companyId が未設定です。");
-      return;
-    }
-
-    const email = inviteEmail.trim().toLowerCase();
-    const looksLikeEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-    if (!looksLikeEmail) {
-      logError("team-invite", "メールアドレス形式が不正です。");
-      return;
-    }
-
-    setInviteSubmitting(true);
-    try {
-      await addDoc(collection(db, "companies", profile.companyId, "teamInvites"), {
-        companyId: profile.companyId,
-        companyName: profile.companyName,
-        email,
-        status: "PENDING",
-        invitedByUid: authUser.uid,
-        invitedByName: profile.displayName,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      setInviteEmail("");
-      setShowInviteModal(false);
-    } catch (error) {
-      logError("team-invite-submit", error);
-    } finally {
-      setInviteSubmitting(false);
-    }
-  };
-
   if (loading) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[#e9eaf4]">
@@ -1408,232 +1274,99 @@ export default function HomePage() {
   }
 
   return (
-    <div className="h-screen overflow-hidden bg-[radial-gradient(1200px_620px_at_20%_-10%,#e7eeff_0%,#edf1fa_45%,#e9edf6_100%)]">
+    <div className="h-screen overflow-hidden bg-[linear-gradient(180deg,#f8fafc_0%,#eef3f9_100%)]">
       <div className="h-full p-4 text-[15px] md:p-6">
-        <div className="grid h-full grid-cols-1 gap-3 lg:grid-cols-[420px_1fr]">
-          <aside className="rounded-lg border border-[#d8deef] bg-white/90 shadow-[0_14px_40px_rgba(17,41,120,0.08)] backdrop-blur-sm">
-            <div className="border-b border-[#dedfea] px-6 py-4">
+        <div className="grid h-full grid-cols-1 gap-3 xl:grid-cols-[360px_minmax(0,1fr)_300px]">
+          <aside className="flex min-h-0 flex-col border border-[#d7e1ee] bg-[#fbfdff] text-[#1f2a37] shadow-[0_18px_40px_rgba(0,37,84,0.08)]">
+            <div className="border-b border-[#e2eaf4] px-6 py-5">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <h1 className="text-xl font-semibold tracking-tight text-[#20263a]">チャット履歴</h1>
-                  <p className="mt-1 text-sm text-[#5a627c]">
+                  <div className="flex items-center gap-3">
+                    <Image
+                      src="/upmologo1.png"
+                      alt="upmo logo"
+                      width={34}
+                      height={34}
+                      className="h-[34px] w-[34px] object-contain"
+                      priority
+                    />
+                    <h1 className="font-mono text-2xl font-semibold uppercase tracking-[0.22em] text-[#004aad]">upmo</h1>
+                  </div>
+                  <p className="mt-2 text-[10px] tracking-[0.16em] text-[#7a8ba3]">
                     {profile?.companyName ?? "会社名"} / {profile?.displayName ?? "ユーザー"}
                   </p>
                 </div>
                 <button
                   onClick={handleLogout}
-                  className="rounded-md border border-[#d4dcf0] bg-white px-3 py-2 text-xs font-medium text-[#334066] hover:bg-[#f7f9ff]"
+                  className="border border-[#d3ddea] bg-white px-3 py-2 text-[10px] font-semibold tracking-[0.14em] text-[#516274] hover:bg-[#f6f9fc]"
                 >
                   ログアウト
                 </button>
               </div>
             </div>
 
-            <div className="p-4">
-              <button
-                type="button"
-                onClick={openInviteModal}
-                className="w-full rounded-md border border-[#cfd8f0] bg-white px-3 py-2 text-sm font-medium text-[#2f3f6d] hover:bg-[#f7f9ff]"
-              >
-                ＋チーム追加
-              </button>
-
-              <div className="mt-4">
-                <p className="mb-2 text-xs font-semibold tracking-wide text-[#6a748f]">チーム</p>
-                <div className="space-y-2">
-                  {teams.map((team) => (
-                    <div key={team.id} className="space-y-1">
+            <div className="min-h-0 overflow-y-auto p-4">
+              <div>
+                <div className="mb-4">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">ナレッジ一覧</p>
+                    <div className="relative">
                       <button
                         type="button"
-                        onClick={() => {
-                          setActiveChat({ type: "team", teamId: team.id });
-                          setSelectedChatId(null);
-                        }}
-                        className={`w-full rounded-sm border px-3 py-2 text-left text-sm ${
-                          activeChat.type === "team" && activeChat.teamId === team.id
-                            ? "border-[#1440e1] bg-[#eff3ff] text-[#1440e1]"
-                            : "border-[#e2e5f0] bg-white text-[#2f354a] hover:bg-[#f8faff]"
-                        }`}
+                        onClick={() => setShowKnowledgeMenu((prev) => !prev)}
+                        className="flex h-8 items-center justify-center border border-[#bfd2ec] bg-[#f7fbff] px-3 text-[11px] font-semibold tracking-[0.08em] text-[#004aad] hover:bg-[#eef5ff]"
                       >
-                        {team.name}
+                        ＋ナレッジを追加
                       </button>
-                      {activeChat.type === "team" && activeChat.teamId === team.id ? (
-                        <div className="space-y-1 rounded-sm border border-[#e4e8f4] bg-[#fafbff] p-2">
-                          {chatThreads.map((thread) => (
-                            <button
-                              key={thread.id}
-                              type="button"
-                              onClick={() => setSelectedChatId(thread.id)}
-                              className={`w-full rounded-sm px-2 py-1 text-left text-xs ${
-                                selectedChatId === thread.id
-                                  ? "bg-[#eaf0ff] font-medium text-[#1440e1]"
-                                  : "text-[#4b5268] hover:bg-[#f1f4ff]"
-                              }`}
-                            >
-                              {formatChatThreadLabel(thread)}
-                            </button>
-                          ))}
-                          {chatThreads.length === 0 ? (
-                            <p className="px-2 py-1 text-xs text-[#7a8198]">履歴はまだありません</p>
-                          ) : null}
+                      {showKnowledgeMenu ? (
+                        <div className="absolute right-0 top-9 z-30 w-40 border border-[#d7e1ee] bg-white p-1 shadow-[0_16px_30px_rgba(0,37,84,0.12)]">
                           <button
-                            type="button"
-                            onClick={() => void handleCreateNewChat()}
-                            disabled={creatingChat}
-                            className="w-full rounded-sm border border-[#cfd8f0] bg-white px-2 py-1 text-xs font-medium text-[#1440e1] hover:bg-[#f5f8ff] disabled:opacity-60"
+                            onClick={() => {
+                              setShowKnowledgeMenu(false);
+                              pdfInputRef.current?.click();
+                            }}
+                            className="block w-full px-2 py-1.5 text-left text-xs text-[#314154] hover:bg-[#f3f8ff]"
                           >
-                            {creatingChat ? "作成中..." : "+NEWチャット"}
+                            PDFを追加
+                          </button>
+                          <button
+                            onClick={() => {
+                              setShowKnowledgeMenu(false);
+                              setShowTextModal(true);
+                            }}
+                            className="block w-full px-2 py-1.5 text-left text-xs text-[#314154] hover:bg-[#f3f8ff]"
+                          >
+                            テキストを追加
+                          </button>
+                          <button
+                            onClick={() => {
+                              setShowKnowledgeMenu(false);
+                              setShowUrlModal(true);
+                            }}
+                            className="block w-full px-2 py-1.5 text-left text-xs text-[#314154] hover:bg-[#f3f8ff]"
+                          >
+                            URLを追加
                           </button>
                         </div>
                       ) : null}
+                      <input
+                        ref={pdfInputRef}
+                        type="file"
+                        accept="application/pdf"
+                        multiple
+                        onChange={(event) => handleUpload(event, "pdf")}
+                        className="hidden"
+                      />
                     </div>
-                  ))}
-                  {teams.length === 0 ? (
-                    <p className="rounded-sm border border-dashed border-[#d8deee] px-3 py-2 text-xs text-[#7a8198]">
-                      チームがまだありません
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="my-4 border-t border-[#e2e7f5]" />
-
-                <p className="mb-2 text-xs font-semibold tracking-wide text-[#6a748f]">個人チャット履歴</p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveChat({ type: "personal" });
-                    setSelectedChatId(null);
-                  }}
-                  className={`w-full rounded-sm border px-3 py-2 text-left text-sm ${
-                    activeChat.type === "personal"
-                      ? "border-[#1440e1] bg-[#eff3ff] text-[#1440e1]"
-                      : "border-[#e2e5f0] bg-white text-[#2f354a] hover:bg-[#f8faff]"
-                  }`}
-                >
-                  個人チャット
-                </button>
-                {activeChat.type === "personal" ? (
-                  <div className="mt-2 space-y-2">
-                    <div className="space-y-1 rounded-sm border border-[#e4e8f4] bg-[#fafbff] p-2">
-                      {chatThreads.map((thread) => (
-                        <button
-                          key={thread.id}
-                          type="button"
-                          onClick={() => setSelectedChatId(thread.id)}
-                          className={`w-full rounded-sm px-2 py-1 text-left text-xs ${
-                            selectedChatId === thread.id
-                              ? "bg-[#eaf0ff] font-medium text-[#1440e1]"
-                              : "text-[#4b5268] hover:bg-[#f1f4ff]"
-                          }`}
-                        >
-                          {formatChatThreadLabel(thread)}
-                        </button>
-                      ))}
-                      {chatThreads.length === 0 ? (
-                        <p className="px-2 py-1 text-xs text-[#7a8198]">履歴はまだありません</p>
-                      ) : null}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void handleCreateNewChat()}
-                      disabled={creatingChat}
-                      className="w-full rounded-sm border border-[#cfd8f0] bg-white px-2 py-1 text-xs font-medium text-[#1440e1] hover:bg-[#f5f8ff] disabled:opacity-60"
-                    >
-                      {creatingChat ? "作成中..." : "+NEWチャット"}
-                    </button>
                   </div>
-                ) : null}
-              </div>
-            </div>
-          </aside>
-
-          <section className="min-h-0 rounded-lg border border-[#d8deef] bg-white/90 shadow-[0_14px_40px_rgba(17,41,120,0.08)] backdrop-blur-sm">
-            <div className="border-b border-[#dedfea] px-6 py-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-semibold tracking-tight text-[#20263a]">{chatTitle}</h2>
-                <div className="flex items-center gap-2">
-                  <div className="relative">
-                    <button
-                      onClick={() => setShowKnowledgeMenu((prev) => !prev)}
-                      className="flex h-8 items-center justify-center rounded-md border border-[#cfd8f0] bg-white px-3 text-xs font-medium text-[#2f3f6d] hover:bg-[#f7f9ff]"
-                    >
-                      ＋ナレッジを追加
-                    </button>
-                    {showKnowledgeMenu ? (
-                      <div className="absolute right-0 top-9 z-30 w-36 rounded-sm border border-[#d5d7e3] bg-white p-1 shadow-sm">
-                        <button
-                          onClick={() => {
-                            setShowKnowledgeMenu(false);
-                            pdfInputRef.current?.click();
-                          }}
-                          className="block w-full rounded-sm px-2 py-1 text-left text-xs text-[#2f3345] hover:bg-[#f2f4fb]"
-                        >
-                          PDFを追加
-                        </button>
-                        <button
-                          onClick={() => {
-                            setShowKnowledgeMenu(false);
-                            setShowTextModal(true);
-                          }}
-                          className="block w-full rounded-sm px-2 py-1 text-left text-xs text-[#2f3345] hover:bg-[#f2f4fb]"
-                        >
-                          テキストを追加
-                        </button>
-                        <button
-                          onClick={() => {
-                            setShowKnowledgeMenu(false);
-                            setShowUrlModal(true);
-                          }}
-                          className="block w-full rounded-sm px-2 py-1 text-left text-xs text-[#2f3345] hover:bg-[#f2f4fb]"
-                        >
-                          URLを追加
-                        </button>
-                      </div>
-                    ) : null}
-                    <input
-                      ref={pdfInputRef}
-                      type="file"
-                      accept="application/pdf"
-                      multiple
-                      onChange={(event) => handleUpload(event, "pdf")}
-                      className="hidden"
-                    />
-                  </div>
-                  <button
-                    onClick={() => setShowUploadedList((prev) => !prev)}
-                    className="rounded-md border border-[#cfd8f0] bg-white px-2 py-1 text-xs font-medium text-[#1440e1] hover:bg-[#f7f9ff]"
-                  >
-                    {showUploadedList ? "一覧を閉じる" : "一覧を開く"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={openMemoModal}
-                    className="rounded-md border border-[#cfd8f0] bg-white px-2 py-1 text-xs font-medium text-[#1440e1] hover:bg-[#f7f9ff]"
-                  >
-                    メモ一覧
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {selectedKnowledgeLabel ? (
-              <div className="border-b border-[#eef1f8] px-6 py-2 text-center text-sm font-semibold text-[#1440e1]">
-                --------- {selectedKnowledgeLabel} を選択中 ---------
-              </div>
-            ) : null}
-
-            <div className="flex h-[calc(100%-72px)] min-h-0 flex-col">
-              {showUploadedList ? (
-                <div className="border-b border-[#dedfea] bg-[#fbfbfd] px-6 py-4">
-                  <p className="text-xs text-[#6f7280]">アップロード済みナレッジ</p>
-                  <ul className="mt-2 max-h-40 space-y-2 overflow-auto">
+                  <ul className="max-h-48 space-y-2 overflow-auto border border-[#e2eaf4] bg-[#f8fbff] p-2">
                     {sources.map((source) => (
                       <li
                         key={source.id}
-                        className={`rounded-sm border bg-white p-2 ${
+                        className={`border bg-white p-2 ${
                           selectedKnowledge?.id === source.id
-                            ? "border-[#1440e1]"
-                            : "border-[#e2e3eb]"
+                            ? "border-[#004aad] bg-[#eef5ff]"
+                            : "border-[#e1e9f3] bg-white"
                         }`}
                       >
                         <div className="flex items-start gap-2">
@@ -1645,9 +1378,20 @@ export default function HomePage() {
                                 name: source.name,
                               })
                             }
-                            className="min-w-0 flex-1 truncate rounded-sm px-1 py-1 text-left text-sm text-[#2f3240] hover:bg-[#f2f4fb]"
+                            className={`min-w-0 flex-1 px-1 py-1 text-left text-sm ${
+                              selectedKnowledge?.id === source.id
+                                ? "text-[#004aad]"
+                                : "text-[#2f3f53] hover:bg-[#f5f8fc]"
+                            }`}
                           >
-                            {source.name}
+                            <span className="flex items-center gap-2">
+                              <span className="truncate">{source.name}</span>
+                              {source.updateMemo?.trim() ? (
+                                <span className="shrink-0 border border-[#bfd2ec] bg-[#eef5ff] px-1.5 py-0.5 text-[10px] font-semibold tracking-[0.08em] text-[#004aad]">
+                                  変更メモあり
+                                </span>
+                              ) : null}
+                            </span>
                           </button>
                           <button
                             type="button"
@@ -1656,7 +1400,7 @@ export default function HomePage() {
                               void handleDeleteSource(source);
                             }}
                             disabled={deletingSourceId === source.id}
-                            className="rounded-sm border border-[#d5d7e3] px-2 py-1 text-[11px] text-[#5a5e6d] disabled:opacity-50"
+                            className="border border-[#d3ddea] px-2 py-1 text-[11px] text-[#6b7d92] disabled:opacity-50"
                           >
                             {deletingSourceId === source.id ? "削除中" : "削除"}
                           </button>
@@ -1664,27 +1408,100 @@ export default function HomePage() {
                       </li>
                     ))}
                     {sources.length === 0 ? (
-                      <li className="rounded-sm border border-dashed border-[#d5d7e4] p-2 text-xs text-[#6f7280]">
+                      <li className="border border-dashed border-[#d7e1ee] p-2 text-xs text-[#7a8ba3]">
                         まだナレッジがありません
                       </li>
                     ) : null}
                   </ul>
                 </div>
-              ) : null}
 
+                <div className="mb-4 border-t border-[#e6edf5]" />
+
+                <button
+                  type="button"
+                  onClick={() => setShowPersonalSection((prev) => !prev)}
+                  className="mb-2 flex w-full items-center justify-between px-1 py-2 text-left"
+                >
+                  <span className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">チャット履歴</span>
+                  <span className="text-sm text-[#7a8ba3]">{showPersonalSection ? "−" : "+"}</span>
+                </button>
+                {showPersonalSection ? (
+                  <>
+                    <div className="max-h-48 space-y-1 overflow-auto border border-[#e2eaf4] bg-[#f8fbff] p-2">
+                      {chatThreads.map((thread) => (
+                        <div key={thread.id} className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedChatId(thread.id)}
+                            className={`min-w-0 flex-1 px-2 py-1 text-left text-xs ${
+                              selectedChatId === thread.id
+                                ? "bg-[#eaf3ff] font-medium text-[#004aad]"
+                                : "text-[#5c6d81] hover:bg-[#edf4fb]"
+                            }`}
+                          >
+                            {formatChatThreadLabel(thread)}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteChatThread(thread)}
+                            disabled={deletingChatId === thread.id}
+                            className="shrink-0 border border-[#d3ddea] px-2 py-1 text-[11px] text-[#6b7d92] disabled:opacity-50"
+                          >
+                            {deletingChatId === thread.id ? "削除中" : "削除"}
+                          </button>
+                        </div>
+                      ))}
+                      {chatThreads.length === 0 ? (
+                        <p className="px-2 py-1 text-xs text-[#7a8ba3]">履歴はまだありません</p>
+                      ) : null}
+                    </div>
+                  </>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => void handleCreatePersonalChat()}
+                  disabled={creatingChat}
+                  className="mt-3 w-full border border-[#004aad] bg-[#004aad] px-2 py-2 text-xs font-semibold tracking-[0.08em] text-white hover:bg-[#0b5bc8] disabled:opacity-60"
+                >
+                  {creatingChat ? "作成中..." : "+NEWチャット"}
+                </button>
+              </div>
+            </div>
+          </aside>
+
+          <section className="min-h-0 border border-[#d7e1ee] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] shadow-[0_18px_40px_rgba(0,37,84,0.08)]">
+            <div className="border-b border-[#e2eaf4] px-6 py-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">WORKSPACE</p>
+                  <h2 className="mt-1 text-xl font-semibold tracking-tight text-[#243142]">{chatTitle}</h2>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={openMemoModal}
+                    className="border border-[#bfd2ec] bg-[#f7fbff] px-3 py-2 text-xs font-semibold tracking-[0.08em] text-[#004aad] hover:bg-[#eef5ff] xl:hidden"
+                  >
+                    メモ一覧
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex h-[calc(100%-72px)] min-h-0 flex-col">
               <div ref={messagesContainerRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto p-6">
                 {actionNotice ? (
-                  <div className="rounded-sm border border-[#d9e4ff] bg-[#f2f6ff] px-3 py-2 text-sm text-[#21459c]">
+                  <div className="border border-[#d7e4f3] bg-[#f3f8fd] px-3 py-2 text-sm text-[#486179]">
                     {actionNotice}
                   </div>
                 ) : null}
-                {messages.length === 0 && activeChat.type === "team" && sources.length === 0 ? (
+                {messages.length === 0 && sources.length === 0 ? (
                   <div className="mx-auto mt-20 max-w-2xl text-center">
                     <h3 className="text-3xl font-semibold text-[#333640]">
                       ナレッジを追加して始める
                     </h3>
                     <p className="mt-3 text-sm text-[#697082]">
-                      このチーム専用のナレッジを追加してください。
+                      まずは PDF やテキストを追加してください。
                     </p>
                   </div>
                 ) : null}
@@ -1693,44 +1510,35 @@ export default function HomePage() {
                   message.sender === "user" ? (
                     <div
                       key={message.id}
-                      className="relative ml-auto w-fit max-w-3xl rounded-[10px] border border-[#e1e6f2] bg-white px-4 py-3 text-base text-[#1f2433] shadow-[3px_3px_0_0_#d6dae4] after:absolute after:-bottom-[6px] after:right-2 after:h-3 after:w-3 after:rotate-45 after:border-r after:border-b after:border-[#e1e6f2] after:bg-white after:shadow-[2px_2px_0_0_#d6dae4] after:content-['']"
+                      className="relative ml-auto w-fit max-w-3xl border border-[#004aad] bg-[#004aad] px-4 py-3 text-base text-white shadow-[4px_4px_0_0_#d7e3f5]"
                     >
                       <p>{message.text}</p>
                     </div>
                   ) : (
                     <div key={message.id} className="mr-auto flex max-w-3xl items-start gap-2">
-                      <div className="mt-0.5 inline-flex h-7 w-7 shrink-0 aspect-square items-center justify-center rounded-full bg-[#1440e1] text-white">
-                        <svg
-                          viewBox="0 0 24 24"
-                          className="h-4 w-4"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M12 4v2" />
-                          <rect x="6" y="7" width="12" height="10" rx="2" />
-                          <circle cx="10" cy="12" r="1" fill="currentColor" />
-                          <circle cx="14" cy="12" r="1" fill="currentColor" />
-                          <path d="M9 15h6" />
-                        </svg>
+                      <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 aspect-square items-center justify-center border border-[#bfd2ec] bg-white p-1">
+                        <Image
+                          src="/upmologo2.png"
+                          alt="upmo assistant"
+                          width={24}
+                          height={24}
+                          className="h-6 w-6 object-contain"
+                        />
                       </div>
-                      <div className="w-fit max-w-3xl rounded-[10px] border border-[#cfdcff] bg-[#eaf0ff] px-4 py-3 text-base text-[#1f2a44] shadow-[3px_3px_0_0_#cfdcff]">
+                      <div className="w-fit max-w-3xl border border-[#dde7f2] bg-white px-4 py-3 text-base text-[#2c3948] shadow-[4px_4px_0_0_#edf3fa]">
                         {renderAssistantContent(message.text)}
-                        <div className="mt-3 flex items-center gap-2 border-t border-[#d5e1ff] pt-2">
+                        <div className="mt-3 flex items-center gap-2 border-t border-[#edf3fa] pt-2">
                           <button
                             type="button"
                             onClick={() => void handleCopyMessage(message.text)}
-                            className="rounded-sm border border-[#b8c9fb] bg-white px-2 py-1 text-xs font-medium text-[#244aa8] hover:bg-[#f2f6ff]"
+                            className="border border-[#d7e1ee] bg-white px-2 py-1 text-xs font-semibold text-[#486179] hover:bg-[#f5f8fc]"
                           >
                             コピー
                           </button>
                           <button
                             type="button"
                             onClick={() => void handleSaveMemo(message.text)}
-                            className="rounded-sm border border-[#b8c9fb] bg-white px-2 py-1 text-xs font-medium text-[#244aa8] hover:bg-[#f2f6ff]"
+                            className="border border-[#d7e1ee] bg-white px-2 py-1 text-xs font-semibold text-[#486179] hover:bg-[#f5f8fc]"
                           >
                             メモ保存
                           </button>
@@ -1742,45 +1550,44 @@ export default function HomePage() {
 
                 {sending ? (
                   <div className="mr-auto flex max-w-3xl items-start gap-2">
-                    <div className="mt-0.5 inline-flex h-7 w-7 shrink-0 aspect-square items-center justify-center rounded-full bg-[#1440e1] text-white">
-                      <svg
-                        viewBox="0 0 24 24"
-                        className="h-4 w-4"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.8"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden="true"
-                      >
-                        <path d="M12 4v2" />
-                        <rect x="6" y="7" width="12" height="10" rx="2" />
-                        <circle cx="10" cy="12" r="1" fill="currentColor" />
-                        <circle cx="14" cy="12" r="1" fill="currentColor" />
-                        <path d="M9 15h6" />
-                      </svg>
+                    <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 aspect-square items-center justify-center border border-[#bfd2ec] bg-white p-1">
+                      <Image
+                        src="/upmologo2.png"
+                        alt="upmo assistant"
+                        width={24}
+                        height={24}
+                        className="h-6 w-6 object-contain"
+                      />
                     </div>
-                    <div className="w-fit max-w-3xl rounded-[10px] border border-[#cfdcff] bg-[#eaf0ff] px-4 py-3 text-base text-[#1f2a44] shadow-[3px_3px_0_0_#cfdcff]">
-                      <p className="font-medium text-[#254086]">
-                        回答を作成しています{".".repeat(thinkingDots)}
-                      </p>
-                      <div className="mt-1 flex items-center gap-1">
-                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#5a79e8]" />
-                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#5a79e8] [animation-delay:120ms]" />
-                        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#5a79e8] [animation-delay:240ms]" />
+                    <div className="w-full max-w-md border border-[#d7e4f3] bg-[linear-gradient(180deg,#ffffff_0%,#f5f9ff_100%)] px-4 py-3 text-base text-[#2c3948] shadow-[4px_4px_0_0_#edf3fa]">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">UPMO</p>
+                          <p className="mt-1 font-medium text-[#004aad]">
+                            回答を組み立てています{".".repeat(thinkingDots)}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="h-2 w-2 animate-bounce bg-[#004aad]" />
+                          <span className="h-2 w-2 animate-bounce bg-[#69a2e8] [animation-delay:120ms]" />
+                          <span className="h-2 w-2 animate-bounce bg-[#b8d3f5] [animation-delay:240ms]" />
+                        </div>
+                      </div>
+                      <div className="mt-3 h-1.5 overflow-hidden bg-[#e7eef6]">
+                        <div className="h-full w-1/3 animate-pulse bg-[#004aad]" />
                       </div>
                     </div>
                   </div>
                 ) : null}
 
                 {uploading && uploadStatus ? (
-                  <div className="mr-auto w-fit max-w-3xl rounded-[10px] border border-[#cfdcff] bg-[#eaf0ff] px-4 py-3 text-sm text-[#1f2a44] shadow-[3px_3px_0_0_#cfdcff]">
+                  <div className="mr-auto w-fit max-w-3xl border border-[#dde7f2] bg-white px-4 py-3 text-sm text-[#2c3948] shadow-[4px_4px_0_0_#edf3fa]">
                     <p className="mb-2">
                       {uploadStatus.fileName} をアップロード中... {uploadStatus.progress}%
                     </p>
-                    <div className="h-2 w-full rounded-sm bg-[#e8eaf2]">
+                    <div className="h-2 w-full bg-[#e7eef6]">
                       <div
-                        className="h-2 rounded-sm bg-[#1440e1] transition-all"
+                        className="h-2 bg-[#004aad] transition-all"
                         style={{ width: `${uploadStatus.progress}%` }}
                       />
                     </div>
@@ -1789,17 +1596,17 @@ export default function HomePage() {
 
               </div>
 
-              <form onSubmit={handleAsk} className="border-t border-[#dedfea] bg-white px-6 py-4">
+              <form onSubmit={handleAsk} className="border-t border-[#e2eaf4] bg-[#fbfdff] px-6 py-5">
                 <div className="flex items-center gap-3">
                   <input
                     value={question}
                     onChange={(event) => setQuestion(event.target.value)}
                     placeholder="PDF内容について質問してください"
-                    className="h-12 flex-1 rounded-sm border border-[#d7dae6] px-4 text-base outline-none focus:border-[#6b739a]"
+                    className="h-12 flex-1 border border-[#d6e1ee] bg-white px-4 text-base outline-none placeholder:text-[#93a3b8] focus:border-[#004aad]"
                   />
                   <button
                     disabled={sending}
-                    className="h-12 rounded-sm bg-[#1440e1] px-5 text-base font-medium text-white disabled:opacity-60"
+                    className="h-12 border border-[#004aad] bg-[#004aad] px-5 text-base font-semibold tracking-[0.08em] text-white disabled:opacity-60 hover:bg-[#0b5bc8]"
                   >
                     {sending ? "送信中..." : "送信"}
                   </button>
@@ -1808,38 +1615,238 @@ export default function HomePage() {
             </div>
           </section>
 
+          <aside className="hidden min-h-0 xl:flex xl:flex-col border border-[#d7e1ee] bg-[linear-gradient(180deg,#fdfefe_0%,#f5f9ff_100%)] shadow-[0_18px_40px_rgba(0,37,84,0.08)]">
+            <div className="border-b border-[#e2eaf4] bg-white/80 px-5 py-4 backdrop-blur-sm">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">NOTES</p>
+                  <h3 className="mt-1 text-base font-semibold text-[#243142]">変更メモとコメント</h3>
+                </div>
+                {selectedSource ? (
+                  <span className="shrink-0 border border-[#bfd2ec] bg-white px-2 py-1 text-[10px] font-semibold tracking-[0.08em] text-[#004aad]">
+                    選択中
+                  </span>
+                ) : null}
+              </div>
+              {selectedSource ? (
+                <div className="mt-3 border border-[#dbe6f4] bg-[#f8fbff] px-3 py-2.5">
+                  <p className="truncate text-sm font-semibold text-[#243142]">{selectedSource.name}</p>
+                  <p className="mt-1 text-xs text-[#6f8097]">
+                    {selectedSource.updateMemo?.trim() ? "変更メモあり" : "変更メモなし"}
+                  </p>
+                </div>
+              ) : (
+                <p className="mt-3 text-xs leading-relaxed text-[#7a8ba3]">
+                  ナレッジを選ぶと、ここで変更メモとコメントを管理できます。
+                </p>
+              )}
+            </div>
+            <div className="min-h-0 overflow-y-auto p-4">
+              <div className="space-y-4">
+                <section className="border border-[#dbe6f4] bg-white shadow-[4px_4px_0_0_#edf3fa]">
+                  <div className="border-b border-[#eaf1f8] px-4 py-3">
+                    <p className="text-[11px] font-semibold tracking-[0.14em] text-[#004aad]">UPDATE MEMO</p>
+                    <h4 className="mt-1 text-base font-semibold text-[#243142]">回答に反映する最新情報</h4>
+                    <p className="mt-1 text-xs leading-relaxed text-[#7a8ba3]">
+                      コメントとは別です。ここに書いた内容だけが回答の根拠として優先されます。
+                    </p>
+                  </div>
+                  {selectedSource ? (
+                    <div className="space-y-3 p-4">
+                      <textarea
+                        value={updateMemoDraft}
+                        onChange={(event) => setUpdateMemoDraft(event.target.value)}
+                        placeholder="例: 料金は旧資料から変更済みです。最新版は5ID 3,500円 / 1IDです。"
+                        className="h-28 w-full border border-[#d6e1ee] bg-[#fbfdff] px-3 py-2 text-sm outline-none placeholder:text-[#93a3b8] focus:border-[#004aad]"
+                      />
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-[11px] text-[#7a8ba3]">
+                          {updateMemoDraft.trim() ? "保存すると次回回答から反映されます" : "空欄で保存すると変更メモを解除します"}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => void handleSaveUpdateMemo()}
+                          disabled={updateMemoSubmitting}
+                          className="border border-[#004aad] bg-[#004aad] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
+                        >
+                          {updateMemoSubmitting ? "保存中..." : "変更メモを保存"}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-4 text-sm leading-relaxed text-[#7a8ba3]">
+                      ナレッジを選択すると、ここで回答反映用の変更メモを編集できます。
+                    </div>
+                  )}
+                </section>
+
+                <section className="border border-[#dbe6f4] bg-white shadow-[4px_4px_0_0_#edf3fa]">
+                  <div className="border-b border-[#eaf1f8] px-4 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-semibold tracking-[0.14em] text-[#004aad]">COMMENTS</p>
+                        <h4 className="mt-1 text-base font-semibold text-[#243142]">共有コメント</h4>
+                      </div>
+                      <span className="border border-[#dbe6f4] bg-[#f8fbff] px-2 py-1 text-[10px] font-semibold tracking-[0.08em] text-[#6f8097]">
+                        {comments.length}件
+                      </span>
+                    </div>
+                  </div>
+                  {selectedSource ? (
+                    <div className="space-y-4 p-4">
+                      <form className="space-y-2 border border-[#e8eef6] bg-[#f8fbff] p-3" onSubmit={handleSubmitComment}>
+                        <textarea
+                          value={commentText}
+                          onChange={(event) => setCommentText(event.target.value)}
+                          placeholder="補足、連絡、更新メモなどを残せます"
+                          className="h-20 w-full border border-[#d6e1ee] bg-white px-3 py-2 text-sm outline-none placeholder:text-[#93a3b8] focus:border-[#004aad]"
+                        />
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-[11px] text-[#7a8ba3]">この欄は伝言用です。回答には直接反映しません。</p>
+                          <button
+                            type="submit"
+                            disabled={commentSubmitting || !commentText.trim()}
+                            className="border border-[#004aad] bg-white px-3 py-2 text-xs font-semibold text-[#004aad] disabled:opacity-60"
+                          >
+                            {commentSubmitting ? "投稿中..." : "コメントを追加"}
+                          </button>
+                        </div>
+                      </form>
+                      <div className="space-y-3">
+                        {comments.map((comment) => (
+                          <article key={comment.id} className="border-l-2 border-[#004aad] bg-[#f8fbff] px-3 py-3">
+                            <div className="flex items-start justify-between gap-2">
+                              <div>
+                                <p className="text-xs font-semibold text-[#314154]">{comment.authorName}</p>
+                                <p className="text-[11px] text-[#7a8ba3]">
+                                  {comment.createdAt ? comment.createdAt.toLocaleString("ja-JP") : "投稿時刻不明"}
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => void handleDeleteComment(comment.id)}
+                                disabled={deletingCommentId === comment.id}
+                                className="border border-[#efc8cf] bg-white px-2 py-1 text-[11px] font-semibold text-[#b64559] disabled:opacity-50"
+                              >
+                                {deletingCommentId === comment.id ? "削除中" : "削除"}
+                              </button>
+                            </div>
+                            <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-[#314154]">
+                              {comment.text}
+                            </p>
+                          </article>
+                        ))}
+                        {comments.length === 0 ? (
+                          <div className="border border-dashed border-[#d7e1ee] bg-[#fbfdff] p-4 text-sm leading-relaxed text-[#7a8ba3]">
+                            まだコメントはありません。
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-4 text-sm leading-relaxed text-[#7a8ba3]">
+                      ナレッジを選択すると、ここで共有コメントを残せます。
+                    </div>
+                  )}
+                </section>
+
+                <section className="border border-[#dbe6f4] bg-white shadow-[4px_4px_0_0_#edf3fa]">
+                  <div className="border-b border-[#eaf1f8] px-4 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-semibold tracking-[0.14em] text-[#004aad]">MEMOS</p>
+                        <h4 className="mt-1 text-base font-semibold text-[#243142]">保存メモ</h4>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleClearMemos()}
+                        disabled={savedMemos.length === 0}
+                        className="border border-[#efc8cf] bg-[#fff7f8] px-2 py-1 text-[11px] font-semibold text-[#b64559] disabled:opacity-50"
+                      >
+                        全削除
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-3 p-4">
+                    {savedMemos.map((memo) => (
+                      <article key={memo.id} className="border border-[#e8eef6] bg-[#fbfdff] p-3">
+                        <div className="flex items-start justify-between gap-2">
+                          <p className="text-[11px] leading-relaxed text-[#7a8ba3]">
+                            {memo.createdAt ? memo.createdAt.toLocaleString("ja-JP") : "保存時刻不明"}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => void handleDeleteMemo(memo.id)}
+                            className="border border-[#efc8cf] bg-white px-2 py-1 text-[11px] font-semibold text-[#b64559]"
+                          >
+                            削除
+                          </button>
+                        </div>
+                        <p className="mt-2 line-clamp-5 whitespace-pre-wrap text-sm leading-relaxed text-[#314154]">
+                          {memo.text}
+                        </p>
+                        <div className="mt-3 flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyMessage(memo.text)}
+                            className="border border-[#bfd2ec] bg-white px-2 py-1 text-[11px] font-semibold text-[#004aad] hover:bg-[#eef5ff]"
+                          >
+                            コピー
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleReuseMemo(memo.text)}
+                            className="border border-[#bfd2ec] bg-[#eef5ff] px-2 py-1 text-[11px] font-semibold text-[#004aad] hover:bg-[#dfecff]"
+                          >
+                            再利用
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                    {savedMemos.length === 0 ? (
+                      <div className="border border-dashed border-[#d7e1ee] bg-[#fbfdff] p-4 text-sm leading-relaxed text-[#7a8ba3]">
+                        保存したメモがここに表示されます。
+                      </div>
+                    ) : null}
+                  </div>
+                </section>
+              </div>
+            </div>
+          </aside>
+
         </div>
       </div>
 
       {showTextModal ? (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div className="w-full max-w-xl rounded-md border border-[#d7d8e2] bg-white p-5">
-            <h3 className="text-base font-semibold text-[#2d2f39]">テキストを追加</h3>
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#eef3f9]/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-xl border border-[#d7e1ee] bg-white p-6 shadow-[0_18px_40px_rgba(0,37,84,0.12)]">
+            <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">KNOWLEDGE</p>
+            <h3 className="mt-1 text-lg font-semibold text-[#243142]">テキストを追加</h3>
             <form className="mt-4 space-y-3" onSubmit={handleTextModalSubmit}>
               <input
                 value={textTitle}
                 onChange={(event) => setTextTitle(event.target.value)}
                 placeholder="タイトル（任意）"
-                className="h-10 w-full rounded-sm border border-[#d7dae6] px-3 text-sm outline-none focus:border-[#6b739a]"
+                className="h-11 w-full border border-[#d6e1ee] bg-white px-3 text-sm outline-none placeholder:text-[#93a3b8] focus:border-[#004aad]"
               />
               <textarea
                 value={textBody}
                 onChange={(event) => setTextBody(event.target.value)}
                 placeholder="ここにテキストを貼り付け"
-                className="h-48 w-full rounded-sm border border-[#d7dae6] px-3 py-2 text-sm outline-none focus:border-[#6b739a]"
+                className="h-48 w-full border border-[#d6e1ee] bg-white px-3 py-2 text-sm outline-none placeholder:text-[#93a3b8] focus:border-[#004aad]"
                 required
               />
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
                   onClick={() => setShowTextModal(false)}
-                  className="rounded-sm border border-[#d5d7e3] px-3 py-2 text-xs text-[#4a4f60]"
+                  className="border border-[#d7e1ee] bg-white px-3 py-2 text-xs font-semibold text-[#5b6d83]"
                 >
                   キャンセル
                 </button>
                 <button
                   type="submit"
-                  className="rounded-sm bg-[#1440e1] px-3 py-2 text-xs text-white"
+                  className="border border-[#004aad] bg-[#004aad] px-3 py-2 text-xs font-semibold text-white"
                 >
                   追加
                 </button>
@@ -1850,15 +1857,16 @@ export default function HomePage() {
       ) : null}
 
       {showUrlModal ? (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div className="w-full max-w-xl rounded-md border border-[#d7d8e2] bg-white p-5">
-            <h3 className="text-base font-semibold text-[#2d2f39]">URLを追加</h3>
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#eef3f9]/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-xl border border-[#d7e1ee] bg-white p-6 shadow-[0_18px_40px_rgba(0,37,84,0.12)]">
+            <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">KNOWLEDGE</p>
+            <h3 className="mt-1 text-lg font-semibold text-[#243142]">URLを追加</h3>
             <form className="mt-4 space-y-3" onSubmit={handleUrlModalSubmit}>
               <input
                 value={urlInput}
                 onChange={(event) => setUrlInput(event.target.value)}
                 placeholder="https://example.com/article"
-                className="h-10 w-full rounded-sm border border-[#d7dae6] px-3 text-sm outline-none focus:border-[#6b739a]"
+                className="h-11 w-full border border-[#d6e1ee] bg-white px-3 text-sm outline-none placeholder:text-[#93a3b8] focus:border-[#004aad]"
                 required
               />
               <div className="flex justify-end gap-2">
@@ -1869,14 +1877,14 @@ export default function HomePage() {
                     setUrlInput("");
                     setShowUrlModal(false);
                   }}
-                  className="rounded-sm border border-[#d5d7e3] px-3 py-2 text-xs text-[#4a4f60]"
+                  className="border border-[#d7e1ee] bg-white px-3 py-2 text-xs font-semibold text-[#5b6d83]"
                 >
                   キャンセル
                 </button>
                 <button
                   type="submit"
                   disabled={urlSubmitting}
-                  className="rounded-sm bg-[#1440e1] px-3 py-2 text-xs text-white disabled:opacity-60"
+                  className="border border-[#004aad] bg-[#004aad] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60"
                 >
                   {urlSubmitting ? "追加中..." : "追加"}
                 </button>
@@ -1886,159 +1894,27 @@ export default function HomePage() {
         </div>
       ) : null}
 
-      {showTeamChatModal ? (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div className="w-full max-w-xl rounded-md border border-[#d7d8e2] bg-white p-5">
-            <h3 className="text-base font-semibold text-[#2d2f39]">チームチャットを作成</h3>
-            <p className="mt-2 text-xs text-[#6a748f]">
-              引き継ぎたいナレッジがあれば選択してください。選択しない場合は空のチームチャットを作成します。
-            </p>
-            <form className="mt-4 space-y-3" onSubmit={handleTeamChatCreateSubmit}>
-              <div className="max-h-64 space-y-2 overflow-auto rounded-sm border border-[#e2e5f0] bg-[#fbfcff] p-3">
-                {globalSources.map((source) => (
-                  <label
-                    key={source.id}
-                    className="flex cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-[#f2f5ff]"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={inheritSourceIds.includes(source.id)}
-                      onChange={() => toggleInheritSource(source.id)}
-                      className="h-4 w-4 accent-[#1440e1]"
-                    />
-                    <span className="truncate text-sm text-[#2f354a]">{source.name}</span>
-                  </label>
-                ))}
-                {globalSources.length === 0 ? (
-                  <p className="text-xs text-[#7a8198]">登録済みナレッジがありません</p>
-                ) : null}
-              </div>
-              <div className="flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (creatingChat) return;
-                    setInheritSourceIds([]);
-                    setShowTeamChatModal(false);
-                  }}
-                  className="rounded-sm border border-[#d5d7e3] px-3 py-2 text-xs text-[#4a4f60]"
-                >
-                  キャンセル
-                </button>
-                <button
-                  type="submit"
-                  disabled={creatingChat}
-                  className="rounded-sm bg-[#1440e1] px-3 py-2 text-xs text-white disabled:opacity-60"
-                >
-                  {creatingChat ? "作成中..." : "作成する"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      ) : null}
-
-      {showInviteModal ? (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div className="w-full max-w-xl rounded-md border border-[#d7d8e2] bg-white p-5">
-            <h3 className="text-base font-semibold text-[#2d2f39]">チーム追加</h3>
-            <p className="mt-2 text-xs text-[#6a748f]">
-              チーム名とメンバーを設定し、必要なら下からメンバー招待もできます。
-            </p>
-
-            <form className="mt-4 space-y-3" onSubmit={handleCreateTeam}>
-              <input
-                value={teamName}
-                onChange={(event) => setTeamName(event.target.value)}
-                placeholder="チーム名を入力"
-                className="h-10 w-full rounded-sm border border-[#d7dae6] px-3 text-sm outline-none focus:border-[#6b739a]"
-                required
-              />
-              <div className="rounded-sm border border-[#e2e5f0] bg-[#fbfcff] p-3">
-                <p className="text-xs font-medium text-[#5f6986]">同じ会社のメンバー</p>
-                {companyMembers.length === 0 ? (
-                  <p className="mt-2 text-xs text-[#7a849d]">ここに同じ会社のメンバーが表示されます</p>
-                ) : (
-                  <ul className="mt-2 max-h-40 space-y-2 overflow-auto">
-                    {companyMembers.map((member) => (
-                      <li key={member.uid}>
-                        <label className="flex cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-[#f2f5ff]">
-                          <input
-                            type="checkbox"
-                            checked={selectedMemberUids.includes(member.uid)}
-                            onChange={() => toggleMemberSelection(member.uid)}
-                            className="h-4 w-4 accent-[#1440e1]"
-                          />
-                          <span className="text-sm text-[#2f354a]">{member.displayName}</span>
-                          <span className="truncate text-xs text-[#7a8198]">{member.email}</span>
-                        </label>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-              <div className="flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={closeInviteModal}
-                  className="rounded-sm border border-[#d5d7e3] px-3 py-2 text-xs text-[#4a4f60]"
-                >
-                  キャンセル
-                </button>
-                <button
-                  type="submit"
-                  disabled={teamSubmitting}
-                  className="rounded-sm bg-[#1440e1] px-3 py-2 text-xs text-white disabled:opacity-60"
-                >
-                  {teamSubmitting ? "作成中..." : "チームを作成"}
-                </button>
-              </div>
-            </form>
-
-            <div className="my-4 h-px bg-[#e5e8f2]" />
-
-            <form className="space-y-3" onSubmit={handleInviteSubmit}>
-              <p className="text-xs font-medium text-[#5f6986]">メンバー招待</p>
-              <input
-                type="email"
-                value={inviteEmail}
-                onChange={(event) => setInviteEmail(event.target.value)}
-                placeholder="example@company.com"
-                className="h-10 w-full rounded-sm border border-[#d7dae6] px-3 text-sm outline-none focus:border-[#6b739a]"
-                required
-              />
-              <div className="flex justify-end">
-                <button
-                  type="submit"
-                  disabled={inviteSubmitting}
-                  className="rounded-sm border border-[#c8d3f7] bg-[#f5f7ff] px-3 py-2 text-xs font-medium text-[#1440e1] disabled:opacity-60"
-                >
-                  {inviteSubmitting ? "送信中..." : "招待を送信"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      ) : null}
-
       {showMemoModal ? (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div className="w-full max-w-3xl rounded-md border border-[#d7d8e2] bg-white p-5">
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#eef3f9]/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-3xl border border-[#d7e1ee] bg-white p-6 shadow-[0_18px_40px_rgba(0,37,84,0.12)]">
             <div className="flex items-center justify-between gap-2">
-              <h3 className="text-base font-semibold text-[#2d2f39]">保存メモ一覧</h3>
+              <div>
+                <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">MEMOS</p>
+                <h3 className="mt-1 text-lg font-semibold text-[#243142]">保存メモ一覧</h3>
+              </div>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => void handleClearMemos()}
                   disabled={savedMemos.length === 0}
-                  className="rounded-sm border border-[#e4c9cb] bg-[#fff6f7] px-3 py-2 text-xs text-[#ad2f3f] disabled:opacity-50"
+                  className="border border-[#efc8cf] bg-[#fff7f8] px-3 py-2 text-xs font-semibold text-[#b64559] disabled:opacity-50"
                 >
                   全削除
                 </button>
                 <button
                   type="button"
                   onClick={() => setShowMemoModal(false)}
-                  className="rounded-sm border border-[#d5d7e3] px-3 py-2 text-xs text-[#4a4f60]"
+                  className="border border-[#d7e1ee] bg-white px-3 py-2 text-xs font-semibold text-[#5b6d83]"
                 >
                   閉じる
                 </button>
@@ -2046,35 +1922,42 @@ export default function HomePage() {
             </div>
             <div className="mt-4 max-h-[60vh] space-y-3 overflow-auto">
               {savedMemos.map((memo) => (
-                <article key={memo.id} className="rounded-sm border border-[#e2e5f0] bg-[#fbfcff] p-3">
+                <article key={memo.id} className="border border-[#e2eaf4] bg-[#f8fbff] p-3">
                   <div className="flex items-center justify-between gap-2">
-                    <p className="text-xs text-[#6a748f]">
+                    <p className="text-xs text-[#7a8ba3]">
                       {memo.createdAt ? memo.createdAt.toLocaleString("ja-JP") : "保存時刻不明"}
                     </p>
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
                         onClick={() => void handleCopyMessage(memo.text)}
-                        className="rounded-sm border border-[#b8c9fb] bg-white px-2 py-1 text-xs font-medium text-[#244aa8] hover:bg-[#f2f6ff]"
+                        className="border border-[#bfd2ec] bg-white px-2 py-1 text-xs font-semibold text-[#004aad] hover:bg-[#eef5ff]"
                       >
                         コピー
                       </button>
                       <button
                         type="button"
+                        onClick={() => handleReuseMemo(memo.text)}
+                        className="border border-[#bfd2ec] bg-white px-2 py-1 text-xs font-semibold text-[#004aad] hover:bg-[#eef5ff]"
+                      >
+                        再利用
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => void handleDeleteMemo(memo.id)}
-                        className="rounded-sm border border-[#e4c9cb] bg-[#fff6f7] px-2 py-1 text-xs font-medium text-[#ad2f3f] hover:bg-[#ffedf0]"
+                        className="border border-[#efc8cf] bg-[#fff7f8] px-2 py-1 text-xs font-semibold text-[#b64559] hover:bg-[#fff0f2]"
                       >
                         削除
                       </button>
                     </div>
                   </div>
-                  <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-[#2f354a]">
+                  <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-[#314154]">
                     {memo.text}
                   </p>
                 </article>
               ))}
               {savedMemos.length === 0 ? (
-                <div className="rounded-sm border border-dashed border-[#d5d7e4] p-4 text-sm text-[#6f7280]">
+                <div className="border border-dashed border-[#d7e1ee] p-4 text-sm text-[#7a8ba3]">
                   保存メモはまだありません
                 </div>
               ) : null}
