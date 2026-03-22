@@ -25,6 +25,7 @@ import { deleteObject, getDownloadURL, ref, uploadBytesResumable } from "firebas
 import { auth } from "@/lib/firebase-auth";
 import { db } from "@/lib/firebase-firestore";
 import { storage } from "@/lib/firebase-storage";
+import { documentDoc, documentsCol } from "@/lib/firestore-paths";
 
 type UserProfile = {
   uid: string;
@@ -32,7 +33,7 @@ type UserProfile = {
   displayName: string;
   companyId: string;
   companyName: string;
-  role: "owner" | "member";
+  role: "owner" | "admin" | "member";
 };
 
 type ChatThread = {
@@ -425,7 +426,7 @@ export default function HomePage() {
           displayName: String(data.displayName ?? user.displayName ?? user.email ?? user.uid),
           companyId: String(data.companyId ?? ""),
           companyName: String(data.companyName ?? ""),
-          role: (data.role as "owner" | "member") ?? "member",
+          role: (data.role as "owner" | "admin" | "member") ?? "member",
         });
       } catch (authError) {
         logError("auth-init", authError);
@@ -438,13 +439,13 @@ export default function HomePage() {
   }, [router]);
 
   useEffect(() => {
-    if (!authUser) {
+    if (!authUser || !profile?.companyId) {
       setGlobalSources([]);
       return;
     }
 
     const docsQuery = query(
-      collection(db, "users", authUser.uid, "documents"),
+      documentsCol(profile.companyId),
       orderBy("createdAt", "desc"),
       limit(20),
     );
@@ -466,7 +467,7 @@ export default function HomePage() {
     }, (snapshotError) => logError("documents-snapshot", snapshotError));
 
     return () => unsub();
-  }, [authUser]);
+  }, [authUser, profile?.companyId]);
 
   useEffect(() => {
     if (!authUser) {
@@ -561,13 +562,13 @@ export default function HomePage() {
   }, [selectedSource]);
 
   useEffect(() => {
-    if (!authUser || !selectedSource) {
+    if (!authUser || !profile?.companyId || !selectedSource) {
       setComments([]);
       return;
     }
 
     const commentsQuery = query(
-      collection(db, "users", authUser.uid, "documents", selectedSource.id, "comments"),
+      collection(db, "organizations", profile.companyId, "documents", selectedSource.id, "comments"),
       orderBy("createdAt", "desc"),
       limit(100),
     );
@@ -585,7 +586,7 @@ export default function HomePage() {
       (snapshotError) => logError("comments-snapshot", snapshotError),
     );
     return () => unsub();
-  }, [authUser, selectedSource]);
+  }, [authUser, profile?.companyId, selectedSource]);
 
   useEffect(() => {
     if (!authUser) {
@@ -691,7 +692,7 @@ export default function HomePage() {
     files: File[],
     kind: "pdf" | "text",
   ) => {
-    if (!authUser || files.length === 0) return;
+    if (!authUser || !profile?.companyId || files.length === 0) return;
     const activeId = await ensureActiveChatId();
     if (!activeId) return;
 
@@ -741,10 +742,13 @@ export default function HomePage() {
           summary: analysis.summary,
           storagePath,
           downloadURL,
+          companyId: profile.companyId,
+          uploadedByUid: authUser.uid,
+          uploadedByName: profile.displayName,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         };
-        await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
+        await addDoc(documentsCol(profile.companyId), docPayload);
 
         await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
           sender: "assistant",
@@ -774,7 +778,7 @@ export default function HomePage() {
 
   const handleTextModalSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!authUser) return;
+    if (!authUser || !profile?.companyId) return;
     const activeId = await ensureActiveChatId();
     if (!activeId) return;
 
@@ -794,10 +798,13 @@ export default function HomePage() {
         storagePath: "",
         downloadURL: "",
         sourceType: "text",
+        companyId: profile.companyId,
+        uploadedByUid: authUser.uid,
+        uploadedByName: profile.displayName,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
+      await addDoc(documentsCol(profile.companyId), docPayload);
 
       await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
         sender: "assistant",
@@ -821,7 +828,7 @@ export default function HomePage() {
 
   const handleUrlModalSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!authUser) return;
+    if (!authUser || !profile?.companyId) return;
     const activeId = await ensureActiveChatId();
     if (!activeId) return;
 
@@ -848,10 +855,13 @@ export default function HomePage() {
         sourceUrl: url,
         storagePath: "",
         downloadURL: "",
+        companyId: profile.companyId,
+        uploadedByUid: authUser.uid,
+        uploadedByName: profile.displayName,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
-      await addDoc(collection(db, "users", authUser.uid, "documents"), docPayload);
+      await addDoc(documentsCol(profile.companyId), docPayload);
 
       await addDoc(collection(db, "users", authUser.uid, "chats", activeId, "messages"), {
         sender: "assistant",
@@ -939,7 +949,7 @@ export default function HomePage() {
   };
 
   const handleDeleteSource = async (source: SourceItem) => {
-    if (!authUser) return;
+    if (!authUser || !profile?.companyId) return;
     const shouldDelete = window.confirm(`「${source.name}」を削除しますか？`);
     if (!shouldDelete) return;
 
@@ -954,9 +964,11 @@ export default function HomePage() {
           }
         }
       }
-      const commentsSnap = await getDocs(collection(db, "users", authUser.uid, "documents", source.id, "comments"));
+      const commentsSnap = await getDocs(
+        collection(db, "organizations", profile.companyId, "documents", source.id, "comments"),
+      );
       await Promise.all(commentsSnap.docs.map((commentDoc) => deleteDoc(commentDoc.ref)));
-      await deleteDoc(doc(db, "users", authUser.uid, "documents", source.id));
+      await deleteDoc(documentDoc(profile.companyId, source.id));
       if (selectedKnowledge?.id === source.id) {
         setSelectedKnowledge(null);
         setCommentText("");
@@ -1084,11 +1096,11 @@ export default function HomePage() {
 
   const handleSubmitComment = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!authUser || !profile || !selectedSource || !commentText.trim()) return;
+    if (!authUser || !profile || !profile.companyId || !selectedSource || !commentText.trim()) return;
 
     setCommentSubmitting(true);
     try {
-      await addDoc(collection(db, "users", authUser.uid, "documents", selectedSource.id, "comments"), {
+      await addDoc(collection(db, "organizations", profile.companyId, "documents", selectedSource.id, "comments"), {
         text: commentText.trim(),
         authorName: profile.displayName,
         authorUid: authUser.uid,
@@ -1104,10 +1116,10 @@ export default function HomePage() {
   };
 
   const handleDeleteComment = async (commentId: string) => {
-    if (!authUser || !selectedSource) return;
+    if (!authUser || !profile?.companyId || !selectedSource) return;
     setDeletingCommentId(commentId);
     try {
-      await deleteDoc(doc(db, "users", authUser.uid, "documents", selectedSource.id, "comments", commentId));
+      await deleteDoc(doc(db, "organizations", profile.companyId, "documents", selectedSource.id, "comments", commentId));
       setActionNotice("コメントを削除しました。");
     } catch (error) {
       logError("comment-delete", error);
@@ -1117,10 +1129,10 @@ export default function HomePage() {
   };
 
   const handleSaveUpdateMemo = async () => {
-    if (!authUser || !selectedSource) return;
+    if (!authUser || !profile?.companyId || !selectedSource) return;
     setUpdateMemoSubmitting(true);
     try {
-      await updateDoc(doc(db, "users", authUser.uid, "documents", selectedSource.id), {
+      await updateDoc(documentDoc(profile.companyId, selectedSource.id), {
         updateMemo: updateMemoDraft.trim(),
         updatedAt: serverTimestamp(),
       });
@@ -1620,7 +1632,7 @@ export default function HomePage() {
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <p className="text-[11px] font-semibold tracking-[0.18em] text-[#7a8ba3]">NOTES</p>
-                  <h3 className="mt-1 text-base font-semibold text-[#243142]">変更メモとコメント</h3>
+                  <h3 className="mt-1 text-base font-semibold text-[#243142]">資料メモ</h3>
                 </div>
                 {selectedSource ? (
                   <span className="shrink-0 border border-[#bfd2ec] bg-white px-2 py-1 text-[10px] font-semibold tracking-[0.08em] text-[#004aad]">
@@ -1637,7 +1649,7 @@ export default function HomePage() {
                 </div>
               ) : (
                 <p className="mt-3 text-xs leading-relaxed text-[#7a8ba3]">
-                  ナレッジを選ぶと、ここで変更メモとコメントを管理できます。
+                  資料を選択してください。
                 </p>
               )}
             </div>
@@ -1645,10 +1657,10 @@ export default function HomePage() {
               <div className="space-y-4">
                 <section className="border border-[#dbe6f4] bg-white shadow-[4px_4px_0_0_#edf3fa]">
                   <div className="border-b border-[#eaf1f8] px-4 py-3">
-                    <p className="text-[11px] font-semibold tracking-[0.14em] text-[#004aad]">UPDATE MEMO</p>
-                    <h4 className="mt-1 text-base font-semibold text-[#243142]">回答に反映する最新情報</h4>
+                    <p className="text-[11px] font-semibold tracking-[0.14em] text-[#004aad]">UPDATE NOTE</p>
+                    <h4 className="mt-1 text-base font-semibold text-[#243142]">回答に反映するメモ</h4>
                     <p className="mt-1 text-xs leading-relaxed text-[#7a8ba3]">
-                      コメントとは別です。ここに書いた内容だけが回答の根拠として優先されます。
+                      ここに書いた内容は、本文より優先して回答に反映されます。
                     </p>
                   </div>
                   {selectedSource ? (
@@ -1675,7 +1687,7 @@ export default function HomePage() {
                     </div>
                   ) : (
                     <div className="p-4 text-sm leading-relaxed text-[#7a8ba3]">
-                      ナレッジを選択すると、ここで回答反映用の変更メモを編集できます。
+                      資料を選択してください。
                     </div>
                   )}
                 </section>
@@ -1686,6 +1698,9 @@ export default function HomePage() {
                       <div>
                         <p className="text-[11px] font-semibold tracking-[0.14em] text-[#004aad]">COMMENTS</p>
                         <h4 className="mt-1 text-base font-semibold text-[#243142]">共有コメント</h4>
+                        <p className="mt-1 text-xs leading-relaxed text-[#7a8ba3]">
+                          回答には直接使われない、共有用のメモです。
+                        </p>
                       </div>
                       <span className="border border-[#dbe6f4] bg-[#f8fbff] px-2 py-1 text-[10px] font-semibold tracking-[0.08em] text-[#6f8097]">
                         {comments.length}件
@@ -1745,7 +1760,7 @@ export default function HomePage() {
                     </div>
                   ) : (
                     <div className="p-4 text-sm leading-relaxed text-[#7a8ba3]">
-                      ナレッジを選択すると、ここで共有コメントを残せます。
+                      資料を選択してください。
                     </div>
                   )}
                 </section>

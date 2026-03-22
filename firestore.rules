@@ -30,6 +30,36 @@ service cloud.firestore {
       }
     }
 
+    match /organizations/{orgId} {
+      allow read, create, update: if signedIn() && orgId == myCompanyId();
+      allow delete: if false;
+
+      match /documents/{docId} {
+        allow read, create, update, delete: if signedIn() && orgId == myCompanyId();
+
+        match /comments/{commentId} {
+          allow read, create, update, delete: if signedIn() && orgId == myCompanyId();
+        }
+      }
+
+      match /members/{memberId} {
+        allow read, create, update: if signedIn() && orgId == myCompanyId();
+        allow delete: if false;
+      }
+
+      match /threads/{threadId} {
+        allow read, create, update, delete: if signedIn() && orgId == myCompanyId();
+
+        match /messages/{messageId} {
+          allow read, create, update, delete: if signedIn() && orgId == myCompanyId();
+        }
+      }
+
+      match /chunks/{chunkId} {
+        allow read, create, update, delete: if signedIn() && orgId == myCompanyId();
+      }
+    }
+
     match /users/{userId} {
       allow read: if signedIn() &&
         (
